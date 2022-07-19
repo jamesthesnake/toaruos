@@ -1,6 +1,8 @@
 /**
  * @file kernel/net/e1000.c
  * @brief Intel Gigabit Ethernet device driver
+ * @package x86_64
+ * @package aarch64
  *
  * @copyright
  * This file is part of ToaruOS and is released under the terms
@@ -24,10 +26,13 @@
 #include <kernel/net/netif.h>
 #include <kernel/net/eth.h>
 #include <kernel/module.h>
-#include <kernel/procfs.h>
 #include <errno.h>
 
+#if defined(__x86_64__)
 #include <kernel/arch/x86_64/irq.h>
+#elif defined(__aarch64__)
+#include <kernel/arch/aarch64/gic.h>
+#endif
 #include <kernel/net/e1000.h>
 
 #include <sys/socket.h>
@@ -51,8 +56,8 @@ struct e1000_nic {
 
 	uint8_t * rx_virt[E1000_NUM_RX_DESC];
 	uint8_t * tx_virt[E1000_NUM_TX_DESC];
-	struct e1000_rx_desc * rx;
-	struct e1000_tx_desc * tx;
+	volatile struct e1000_rx_desc * rx;
+	volatile struct e1000_tx_desc * tx;
 	uintptr_t rx_phys;
 	uintptr_t tx_phys;
 
@@ -66,12 +71,42 @@ struct e1000_nic {
 static int device_count = 0;
 static struct e1000_nic * devices[32] = {NULL};
 
+#ifdef __aarch64__
+static uint32_t mmio_read32(uintptr_t addr) {
+	asm volatile ("dc ivac, %0\ndsb sy\nisb\n" :: "r"(addr) : "memory");
+	uint32_t res = *((volatile uint32_t*)(addr));
+	asm volatile ("dmb ish" ::: "memory");
+	return res;
+}
+static void mmio_write32(uintptr_t addr, uint32_t val) {
+	(*((volatile uint32_t*)(addr))) = val;
+	asm volatile ("dsb ishst\nisb\ndc cvac, %0\n" :: "r"(addr) : "memory");
+}
+static void cache_invalidate(void *addr) {
+	uintptr_t a = (uintptr_t)addr;
+	for (uintptr_t x = 0; x < 4096; x += 64) {
+		asm volatile ("dc ivac, %0\n" :: "r"(a + x) : "memory");
+	}
+	asm volatile ("dsb sy\nisb":::"memory");
+}
+
+static void cache_clean(void *addr) {
+	uintptr_t a = (uintptr_t)addr;
+	asm volatile ("dmb ish" ::: "memory");
+	for (uintptr_t x = 0; x < 4096; x += 64) {
+		asm volatile ("dc cvac, %0" :: "r"(a + x) : "memory");
+	}
+	asm volatile ("dsb sy\nisb":::"memory");
+}
+
+#else
 static uint32_t mmio_read32(uintptr_t addr) {
 	return *((volatile uint32_t*)(addr));
 }
 static void mmio_write32(uintptr_t addr, uint32_t val) {
 	(*((volatile uint32_t*)(addr))) = val;
 }
+#endif
 
 static void write_command(struct e1000_nic * device, uint16_t addr, uint32_t val) {
 	mmio_write32(device->mmio_addr + addr, val);
@@ -82,6 +117,9 @@ static uint32_t read_command(struct e1000_nic * device, uint16_t addr) {
 }
 
 static void delay_yield(size_t subticks) {
+#ifdef __aarch64__
+	asm volatile ("isb" ::: "memory");
+#endif
 	unsigned long s, ss;
 	relative_time(0, subticks, &s, &ss);
 	sleep_until((process_t *)this_core->current_process, s, ss);
@@ -170,16 +208,25 @@ static void e1000_queuer(void * data) {
 			head = read_command(nic, E1000_REG_RXDESCHEAD);
 		}
 		if (head != nic->rx_index) {
+#ifdef __aarch64__
+			__sync_synchronize();
+#endif
 			while ((nic->rx[nic->rx_index].status & 0x01) && (processed < budget)) {
 				int i = nic->rx_index;
 				if (!(nic->rx[i].errors & (0x97))) {
 					nic->counts.rx_count++;
 					nic->counts.rx_bytes += nic->rx[i].length;
+#ifdef __aarch64__
+					cache_invalidate(nic->rx_virt[i]);
+#endif
 					net_eth_handle((void*)nic->rx_virt[i], nic->eth.device_node, nic->rx[i].length);
 				} else {
 					printf("error bits set in packet: %x\n", nic->rx[i].errors);
 				}
 				processed++;
+#ifdef __aarch64__
+				__sync_synchronize();
+#endif
 				nic->rx[i].status = 0;
 				if (++nic->rx_index == E1000_NUM_RX_DESC) {
 					nic->rx_index = 0;
@@ -190,18 +237,25 @@ static void e1000_queuer(void * data) {
 				}
 				write_command(nic, E1000_REG_RXDESCTAIL, nic->rx_index);
 				read_command(nic, E1000_REG_STATUS);
+#ifdef __aarch64__
+				__sync_synchronize();
+#endif
 			}
 		}
 		if (processed == 0) {
-			switch_task(0);
+			delay_yield(100000);
 		} else {
-			if (this_core->cpu_id == 0) switch_task(0);
+			if (this_core->cpu_id == 0) switch_task(1);
 		}
 	}
 }
 
+#if defined(__x86_64__)
 static int irq_handler(struct regs *r) {
 	int irq = r->int_no - 32;
+#elif defined(__aarch64__)
+static int e1000_irq_handler(process_t * this, int irq, void * data) {
+#endif
 	int handled = 0;
 
 	for (int i = 0; i < device_count; ++i) {
@@ -211,7 +265,9 @@ static int irq_handler(struct regs *r) {
 				e1000_handle(devices[i], status);
 				if (!handled) {
 					handled = 1;
+#if defined(__x86_64__)
 					irq_ack(irq);
+#endif
 				}
 			}
 		}
@@ -248,10 +304,20 @@ static void send_packet(struct e1000_nic * device, uint8_t* payload, size_t payl
 		} while (tx_full(device, tx_tail, tx_head));
 	}
 
+	int sent = device->tx_index;
+
 	memcpy(device->tx_virt[device->tx_index], payload, payload_size);
+#if defined(__aarch64__)
+	asm volatile ("dmb ish\nisb" ::: "memory");
+	cache_clean(device->tx_virt[device->tx_index]);
+#endif
+
 	device->tx[device->tx_index].length = payload_size;
-	device->tx[device->tx_index].cmd = CMD_EOP | CMD_IFCS | CMD_RS; //| CMD_RPS;
+	device->tx[device->tx_index].cmd = CMD_EOP | CMD_IFCS | CMD_RS | CMD_RPS;
 	device->tx[device->tx_index].status = 0;
+#if defined(__aarch64__)
+	asm volatile ("dmb ish\nisb" ::: "memory");
+#endif
 
 	device->counts.tx_count++;
 	device->counts.tx_bytes += payload_size;
@@ -259,8 +325,16 @@ static void send_packet(struct e1000_nic * device, uint8_t* payload, size_t payl
 	if (++device->tx_index == E1000_NUM_TX_DESC) {
 		device->tx_index = 0;
 	}
+
 	write_command(device, E1000_REG_TXDESCTAIL, device->tx_index);
-	read_command(device, E1000_REG_STATUS);
+	int st = read_command(device, E1000_REG_STATUS);
+	(void)st;
+
+#if defined(__aarch64__)
+	asm volatile ("dc ivac, %0\ndsb sy\n" :: "r"(&device->tx[sent]) : "memory");
+#else
+	(void)sent;
+#endif
 
 	spin_unlock(device->tx_lock);
 }
@@ -308,6 +382,8 @@ static void init_tx(struct e1000_nic * device) {
 	write_command(device, E1000_REG_TCTRL, tctl);
 }
 
+#define privileged() do { if (this_core->current_process->user != USER_ROOT_UID) { return -EPERM; } } while (0)
+
 static int ioctl_e1000(fs_node_t * node, unsigned long request, void * argp) {
 	struct e1000_nic * nic = node->device;
 
@@ -322,6 +398,7 @@ static int ioctl_e1000(fs_node_t * node, unsigned long request, void * argp) {
 			memcpy(argp, &nic->eth.ipv4_addr, sizeof(nic->eth.ipv4_addr));
 			return 0;
 		case SIOCSIFADDR:
+			privileged();
 			memcpy(&nic->eth.ipv4_addr, argp, sizeof(nic->eth.ipv4_addr));
 			return 0;
 		case SIOCGIFNETMASK:
@@ -329,6 +406,7 @@ static int ioctl_e1000(fs_node_t * node, unsigned long request, void * argp) {
 			memcpy(argp, &nic->eth.ipv4_subnet, sizeof(nic->eth.ipv4_subnet));
 			return 0;
 		case SIOCSIFNETMASK:
+			privileged();
 			memcpy(&nic->eth.ipv4_subnet, argp, sizeof(nic->eth.ipv4_subnet));
 			return 0;
 		case SIOCGIFGATEWAY:
@@ -336,6 +414,7 @@ static int ioctl_e1000(fs_node_t * node, unsigned long request, void * argp) {
 			memcpy(argp, &nic->eth.ipv4_gateway, sizeof(nic->eth.ipv4_gateway));
 			return 0;
 		case SIOCSIFGATEWAY:
+			privileged();
 			memcpy(&nic->eth.ipv4_gateway, argp, sizeof(nic->eth.ipv4_gateway));
 			net_arp_ask(nic->eth.ipv4_gateway, node);
 			return 0;
@@ -343,6 +422,7 @@ static int ioctl_e1000(fs_node_t * node, unsigned long request, void * argp) {
 		case SIOCGIFADDR6:
 			return -ENOENT;
 		case SIOCSIFADDR6:
+			privileged();
 			memcpy(&nic->eth.ipv6_addr, argp, sizeof(nic->eth.ipv6_addr));
 			return 0;
 
@@ -379,50 +459,6 @@ static ssize_t write_e1000(fs_node_t *node, off_t offset, size_t size, uint8_t *
 	return size;
 }
 
-static ssize_t e1000_debug_func(fs_node_t * node, off_t offset, size_t size, uint8_t * buffer) {
-	char * buf = malloc(4096);
-	char * out = buf;
-
-	for (int i = 0; i < device_count; ++i) {
-		struct e1000_nic * e1000_debug_nic = devices[i];
-		uint32_t creg = read_command(e1000_debug_nic, E1000_REG_CTRL);
-		uint32_t sreg = read_command(e1000_debug_nic, E1000_REG_STATUS);
-		int rx_head = read_command(e1000_debug_nic, E1000_REG_RXDESCHEAD);
-		int rx_tail = read_command(e1000_debug_nic, E1000_REG_RXDESCTAIL);
-		int tx_head = read_command(e1000_debug_nic, E1000_REG_TXDESCHEAD);
-		int tx_tail = read_command(e1000_debug_nic, E1000_REG_TXDESCTAIL);
-		out += snprintf(out, 4095,
-			"Device %d\n"
-			"Ctrl reg:\t%#x\n"
-			"Status reg:\t%#x\n"
-			"rx head/tail:\t%d %d\n"
-			"tx head/tail:\t%d %d\n",
-			i,
-			creg,
-			sreg,
-			rx_head, rx_tail,
-			tx_head, tx_tail
-			);
-	}
-
-	size_t _bsize = strlen(buf);
-	if ((size_t)offset > _bsize) {
-		free(buf);
-		return 0;
-	}
-	if (size > _bsize - (size_t)offset) size = _bsize - offset;
-
-	memcpy(buffer, buf + offset, size);
-	free(buf);
-	return size;
-}
-
-static struct procfs_entry e1000_debug = {
-	0,
-	"e1000",
-	e1000_debug_func,
-};
-
 static void ints_off(struct e1000_nic * nic) {
 	write_command(nic, E1000_REG_IMC, 0xFFFFFFFF);
 	write_command(nic, E1000_REG_ICR, 0xFFFFFFFF);
@@ -438,48 +474,64 @@ static void e1000_init(struct e1000_nic * nic) {
 	nic->tx_phys = mmu_allocate_n_frames(2) << 12;
 	nic->tx = mmu_map_mmio_region(nic->tx_phys, 8192);
 
-	memset(nic->rx, 0, sizeof(struct e1000_rx_desc) * E1000_NUM_RX_DESC);
-	memset(nic->tx, 0, sizeof(struct e1000_tx_desc) * E1000_NUM_TX_DESC);
+	memset((void*)nic->rx, 0, sizeof(struct e1000_rx_desc) * E1000_NUM_RX_DESC);
+	memset((void*)nic->tx, 0, sizeof(struct e1000_tx_desc) * E1000_NUM_TX_DESC);
 
 	/* Allocate buffers */
 	for (int i = 0; i < E1000_NUM_RX_DESC; ++i) {
 		nic->rx[i].addr = mmu_allocate_a_frame() << 12;
 		nic->rx_virt[i] = mmu_map_mmio_region(nic->rx[i].addr, 4096);
-		mmu_frame_map_address(mmu_get_page((uintptr_t)nic->rx_virt[i],0),MMU_FLAG_WRITABLE|MMU_FLAG_WC,nic->rx[i].addr);
+		mmu_frame_map_address(mmu_get_page((uintptr_t)nic->rx_virt[i],0),MMU_FLAG_KERNEL|MMU_FLAG_WRITABLE,nic->rx[i].addr);
 		nic->rx[i].status = 0;
 	}
 
 	for (int i = 0; i < E1000_NUM_TX_DESC; ++i) {
 		nic->tx[i].addr = mmu_allocate_a_frame() << 12;
 		nic->tx_virt[i] = mmu_map_mmio_region(nic->tx[i].addr, 4096);
-		mmu_frame_allocate(mmu_get_page((uintptr_t)nic->tx_virt[i],0),MMU_FLAG_WRITABLE|MMU_FLAG_WC);
+		mmu_frame_allocate(mmu_get_page((uintptr_t)nic->tx_virt[i],0),MMU_FLAG_KERNEL|MMU_FLAG_WRITABLE);
 		memset(nic->tx_virt[i], 0, 4096);
 		nic->tx[i].status = 0;
 		nic->tx[i].cmd = (1 << 0);
 	}
 
 	uint16_t command_reg = pci_read_field(e1000_device_pci, PCI_COMMAND, 2);
-	command_reg |= (1 << 2);
-	command_reg |= (1 << 0);
+	command_reg = (1 << 1) | (1 << 2);
 	pci_write_field(e1000_device_pci, PCI_COMMAND, 2, command_reg);
 
+#if defined(__aarch64__)
+	pci_write_field(e1000_device_pci, PCI_BAR0, 4, 0x12200000);
+	asm volatile ("isb" ::: "memory");
+#endif
+
 	delay_yield(10000);
+	while (this_core->cpu_id != 0) switch_task(1);
 
 	/* Is this size enough? */
 	uint32_t initial_bar = pci_read_field(e1000_device_pci, PCI_BAR0, 4);
-	nic->mmio_addr = (uintptr_t)mmu_map_mmio_region(initial_bar, 0x8000);
+	nic->mmio_addr = (uintptr_t)mmu_map_mmio_region(initial_bar, 0x20000);
+#if defined(__aarch64__)
+	asm volatile ("isb" ::: "memory");
+#endif
 
 	eeprom_detect(nic);
 	read_mac(nic);
 	write_mac(nic);
+
+	nic->queuer = (process_t*)this_core->current_process;
 
 	#define CTRL_PHY_RST (1UL << 31UL)
 	#define CTRL_RST     (1UL << 26UL)
 	#define CTRL_SLU     (1UL << 6UL)
 	#define CTRL_LRST    (1UL << 3UL)
 
+#if defined(__x86_64__)
 	nic->irq_number = pci_get_interrupt(e1000_device_pci);
 	irq_install_handler(nic->irq_number, irq_handler, nic->eth.if_name);
+#elif defined(__aarch64__)
+	int irq;
+	gic_map_pci_interrupt(nic->eth.if_name,e1000_device_pci,&irq,e1000_irq_handler,nic);
+	nic->irq_number = irq;
+#endif
 
 	/* Disable interrupts */
 	ints_off(nic);
@@ -514,6 +566,7 @@ static void e1000_init(struct e1000_nic * nic) {
 	write_command(nic, E1000_REG_CTRL, status);
 
 	/* Clear statistical counters */
+#ifndef __aarch64__
 	for (int i = 0; i < 128; ++i) {
 		write_command(nic, 0x5200 + i * 4, 0);
 	}
@@ -521,6 +574,7 @@ static void e1000_init(struct e1000_nic * nic) {
 	for (int i = 0; i < 64; ++i) {
 		read_command(nic, 0x4000 + i * 4);
 	}
+#endif
 
 	init_rx(nic);
 	init_tx(nic);
@@ -534,7 +588,7 @@ static void e1000_init(struct e1000_nic * nic) {
 	nic->eth.device_node = calloc(sizeof(fs_node_t),1);
 	snprintf(nic->eth.device_node->name, 100, "%s", nic->eth.if_name);
 	nic->eth.device_node->flags = FS_BLOCKDEVICE; /* NETDEVICE? */
-	nic->eth.device_node->mask  = 0666; /* temporary; shouldn't be doing this with these device files */
+	nic->eth.device_node->mask  = 0644; /* temporary; shouldn't be doing this with these device files */
 	nic->eth.device_node->ioctl = ioctl_e1000;
 	nic->eth.device_node->write = write_e1000;
 	nic->eth.device_node->device = nic;
@@ -580,8 +634,6 @@ static int e1000_install(int argc, char * argv[]) {
 		/* TODO: Clean up? Remove ourselves? */
 		return -ENODEV;
 	}
-
-	procfs_install(&e1000_debug);
 
 	return 0;
 }

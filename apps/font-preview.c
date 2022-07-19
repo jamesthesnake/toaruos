@@ -1,5 +1,10 @@
 /**
  * @brief TrueType font previewer
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2021 K. Lange
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -112,6 +117,9 @@ int main(int argc, char * argv[]) {
 
 	if (argc > 2) {
 		preview_string = argv[2];
+	} else {
+		char * maybe = tt_get_name_string(tt_font, 19);
+		if (maybe) preview_string = maybe;
 	}
 
 	struct decor_bounds bounds;

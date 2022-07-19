@@ -1,11 +1,12 @@
-/* vim: tabstop=4 shiftwidth=4 noexpandtab
- * This file is part of ToaruOS and is released under the terms
- * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2014-2018 K. Lange
- *
- * Yutani Client Library
+/**
+ * @brief Yutani Client Library
  *
  * Client library for the compositing window system.
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2014-2021 K. Lange
  */
 #pragma once
 
@@ -318,7 +319,8 @@ struct yutani_msg_clipboard {
  */
 #define YUTANI_ZORDER_MAX     0xFFFF
 #define YUTANI_ZORDER_TOP     0xFFFF
-#define YUTANI_ZORDER_OVERLAY 0xFFFE
+#define YUTANI_ZORDER_MENU    0xFFFE
+#define YUTANI_ZORDER_OVERLAY 0xFFED
 #define YUTANI_ZORDER_BOTTOM  0x0000
 
 /*

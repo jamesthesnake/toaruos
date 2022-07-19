@@ -1,3 +1,18 @@
+/**
+ * @brief Shared bootloader configuration.
+ *
+ * Sets up menus that present the boot options for both the EFI
+ * and BIOS loaders. If you want to tweak ToaruOS's bootloader
+ * to boot some other Multiboot1-compliant OS, start here.
+ *
+ * This is also the place to add new default startup configs,
+ * add toggles for command line options, and so on.
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2018-2021 K. Lange
+ */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -26,7 +41,7 @@ char * LINK_TEXT = "https://toaruos.org - https://github.com/klange/toaruos";
 #define DEFAULT_GRAPHICAL_CMDLINE "start=live-session "
 #define DEFAULT_SINGLE_CMDLINE "start=terminal\037-F "
 #define DEFAULT_TEXT_CMDLINE "start=--vga vid=text "
-#define DEFAULT_VID_CMDLINE "vid=auto,1440,900 "
+#define DEFAULT_VID_CMDLINE "vid=auto "
 #define MIGRATE_CMDLINE "migrate "
 #define DEFAULT_HEADLESS_CMDLINE "start=--headless "
 
@@ -37,13 +52,12 @@ char cmdline[1024] = {0};
 /* Names of the available boot modes. */
 struct bootmode boot_mode_names[] = {
 	{1, "normal",   "Normal Boot"},
-#ifdef EFI_PLATFORM
 	{2, "video",    "Configure Video Output"},
-#else
-	{2, "vga",      "VGA Text Mode"},
-#endif
 	{3, "single",   "Single-User Graphical Terminal"},
 	{4, "headless", "Headless"},
+#ifndef EFI_PLATFORM
+	{5, "vga",      "VGA Text Mode"},
+#endif
 };
 
 int base_sel = 0;
@@ -91,7 +105,6 @@ int kmain() {
 		/* Loop over rendering the menu */
 		show_menu();
 
-#ifdef EFI_PLATFORM
 		if (boot_mode == 2) {
 			extern int video_menu(void);
 			video_menu();
@@ -99,7 +112,6 @@ int kmain() {
 			memset(cmdline, 0, 1024);
 			continue;
 		}
-#endif
 
 		/* Build our command line. */
 		strcat(cmdline, DEFAULT_ROOT_CMDLINE);
@@ -113,13 +125,13 @@ int kmain() {
 		if (boot_mode == 1) {
 			strcat(cmdline, DEFAULT_GRAPHICAL_CMDLINE);
 			strcat(cmdline, _video_command_line);
-		} else if (boot_mode == 2) {
-			strcat(cmdline, DEFAULT_TEXT_CMDLINE);
 		} else if (boot_mode == 3) {
 			strcat(cmdline, DEFAULT_SINGLE_CMDLINE);
 			strcat(cmdline, _video_command_line);
 		} else if (boot_mode == 4) {
 			strcat(cmdline, DEFAULT_HEADLESS_CMDLINE);
+		} else if (boot_mode == 5) {
+			strcat(cmdline, DEFAULT_TEXT_CMDLINE);
 		}
 
 		if (_debug) {

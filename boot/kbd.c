@@ -1,3 +1,20 @@
+/**
+ * @brief Keyboard reading functions.
+ *
+ * Abstracts away the differences between our EFI and BIOS
+ * environments to provide consistent scancode feedback for
+ * the menus and command line editor.
+ *
+ * For EFI, we use the WaitForKey and ReadKeyStroke interfaces.
+ *
+ * For BIOS, we have a bad PS/2 driver, which should be fine if
+ * you're booting with BIOS?
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2021 K. Lange
+ */
 #include "kbd.h"
 #include "util.h"
 #include "text.h"
@@ -58,7 +75,7 @@ int read_scancode(int timeout) {
 	}
 }
 
-int read_key(char * c) {
+int read_key(int * c) {
 	EFI_INPUT_KEY Key;
 	unsigned long int index;
 	uefi_call_wrapper(ST->BootServices->WaitForEvent, 3, 1, &ST->ConIn->WaitForKey, &index);
@@ -106,10 +123,27 @@ static char kbd_us_l2[128] = {
 	'-', 0, 0, 0, '+', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 };
 
-int read_key(char * c) {
+int read_key(int * c) {
 	static int shift_state = 0;
 
 	int sc = read_scancode(0);
+
+	if (sc == 0xe0) {
+		*c = 0xe0;
+		return 1;
+	}
+
+	if (*c == 0xe0) {
+		*c = 0;
+		switch (sc) {
+			/* Keft left and right */
+			case 0x4B:
+				return shift_state ? 4 : 2;
+			case 0x4D:
+				return shift_state ? 5 : 3;
+		}
+		return 1;
+	}
 
 	switch (sc) {
 		/* Shift down */
@@ -122,10 +156,6 @@ int read_key(char * c) {
 		case 0xB6:
 			shift_state = 0;
 			return 1;
-
-		/* Keft left and right */
-		case 0x4B: return shift_state ? 4 : 2;
-		case 0x4D: return shift_state ? 5 : 3;
 	}
 
 	if (!(sc & 0x80)) {
@@ -136,20 +166,22 @@ int read_key(char * c) {
 	return 1;
 }
 
+extern int do_bios_call(unsigned int function, unsigned int arg1);
+
+int kbd_status(void) {
+	int result = do_bios_call(4,0x11);
+	return (result & 0xFF) == 0;
+}
+
 int read_scancode(int timeout) {
 	if (timeout) {
 		int start_s = read_cmos_seconds();
-		while (!(inportb(0x64) & 1)) {
+		while (kbd_status()) {
 			int now_s = read_cmos_seconds();
 			if (now_s != start_s) return -1;
 		}
-	} else {
-		while (!(inportb(0x64) & 1));
 	}
-	int out;
-	while (inportb(0x64) & 1) {
-		out = inportb(0x60);
-	}
-	return out;
+	int result = do_bios_call(4,0);
+	return result >> 8;
 }
 #endif

@@ -14,11 +14,12 @@
  * kernel state in a manner similar to setjmp/longjmp, as well as saving the
  * outer context in the case of a nested task switch.
  *
- * @copyright This file is part of ToaruOS and is released under the terms
- *            of the NCSA / University of Illinois License - see LICENSE.md
- * @author    2011-2021 K. Lange
- * @author    2012 Markus Schober
- * @author    2015 Dale Weiler
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2011-2021 K. Lange
+ * Copyright (C) 2012 Markus Schober
+ * Copyright (C) 2015 Dale Weiler
  */
 #include <errno.h>
 #include <kernel/assert.h>
@@ -39,7 +40,13 @@
 #include <sys/signal_defs.h>
 
 /* FIXME: This only needs the size of the regs struct... */
+#if defined(__x86_64__)
 #include <kernel/arch/x86_64/regs.h>
+#elif defined(__aarch64__)
+#include <kernel/arch/aarch64/regs.h>
+#else
+#error "no regs"
+#endif
 
 tree_t * process_tree;  /* Stores the parent-child process relationships; the root of this graph is 'init'. */
 list_t * process_list;  /* Stores all existing processes. Mostly used for sanity checking or for places where iterating over all processes is useful. */
@@ -126,20 +133,10 @@ void switch_next(void) {
 		__builtin_unreachable();
 	}
 
-	if (this_core->current_process->flags & PROC_FLAG_STARTED) {
-		/* If this process has a signal pending, we save its current context - including
-		 * the entire kernel stack - before resuming switch_task. */
-		if (!this_core->current_process->signal_kstack) {
-			if (this_core->current_process->signal_queue->length > 0) {
-				this_core->current_process->signal_kstack = malloc(KERNEL_STACK_SIZE);
-				memcpy(this_core->current_process->signal_kstack, (void*)(this_core->current_process->image.stack - KERNEL_STACK_SIZE), KERNEL_STACK_SIZE);
-				memcpy((thread_t*)&this_core->current_process->signal_state, (thread_t*)&this_core->current_process->thread, sizeof(thread_t));
-			}
-		}
-	}
-
 	/* Mark the process as running and started. */
 	__sync_or_and_fetch(&this_core->current_process->flags, PROC_FLAG_STARTED);
+
+	asm volatile ("" ::: "memory");
 
 	/* Jump to next */
 	arch_restore_context(&this_core->current_process->thread);
@@ -187,17 +184,6 @@ void switch_task(uint8_t reschedule) {
 	 * from a task switch and have been awoken if we were sleeping. */
 	if (arch_save_context(&this_core->current_process->thread) == 1) {
 		arch_restore_floating((process_t*)this_core->current_process);
-
-		fix_signal_stacks();
-		if (!(this_core->current_process->flags & PROC_FLAG_FINISHED)) {
-			if (this_core->current_process->signal_queue->length > 0) {
-				node_t * node = list_dequeue(this_core->current_process->signal_queue);
-				signal_t * sig = node->value;
-				free(node);
-				handle_signal((process_t*)this_core->current_process,sig);
-			}
-		}
-
 		return;
 	}
 
@@ -323,7 +309,9 @@ static void _kidle(void) {
 static void _kburn(void) {
 	while (1) {
 		arch_pause();
+#ifndef __aarch64__
 		switch_next();
+#endif
 	}
 }
 
@@ -413,13 +401,12 @@ process_t * spawn_init(void) {
 	mmu_frame_allocate(
 		mmu_get_page(init->image.stack - KERNEL_STACK_SIZE, 0),
 		MMU_FLAG_KERNEL);
-	init->image.shm_heap = 0x200000000; /* That's 8GiB? That should work fine... */
+	init->image.shm_heap = USER_SHM_LOW;
 
 	init->flags         = PROC_FLAG_STARTED | PROC_FLAG_RUNNING;
 	init->wait_queue    = list_create("process wait queue (init)", init);
 	init->shm_mappings  = list_create("process shm mapping (init)", init);
 	init->signal_queue  = list_create("process signal queue (init)", init);
-	init->signal_kstack = NULL; /* Initialized later */
 
 	init->sched_node.prev = NULL;
 	init->sched_node.next = NULL;
@@ -478,7 +465,7 @@ process_t * spawn_process(volatile process_t * parent, int flags) {
 	mmu_frame_allocate(
 		mmu_get_page(proc->image.stack - KERNEL_STACK_SIZE, 0),
 		MMU_FLAG_KERNEL);
-	proc->image.shm_heap    = 0x200000000; /* FIXME this should be a macro def */
+	proc->image.shm_heap    = USER_SHM_LOW;
 
 	if (flags & PROC_REUSE_FDS) {
 		spin_lock(parent->fds->lock);
@@ -527,10 +514,6 @@ process_t * spawn_process(volatile process_t * parent, int flags) {
 extern void tree_remove_reparent_root(tree_t * tree, tree_node_t * node);
 
 void process_reap(process_t * proc) {
-	if (proc->signal_kstack) {
-		free(proc->signal_kstack);
-	}
-
 	if (proc->tracees) {
 		while (proc->tracees->length) {
 			free(list_pop(proc->tracees));
@@ -647,9 +630,9 @@ void process_delete(process_t * proc) {
  * queue before it is placed in the ready queue.
  */
 void make_process_ready(volatile process_t * proc) {
+	int sleep_lock_is_mine = sleep_lock.owner == (this_core->cpu_id + 1);
+	if (!sleep_lock_is_mine) spin_lock(sleep_lock);
 	if (proc->sleep_node.owner != NULL) {
-		int sleep_lock_is_mine = sleep_lock.owner == (this_core->cpu_id + 1);
-		if (!sleep_lock_is_mine) spin_lock(sleep_lock);
 		if (proc->sleep_node.owner == sleep_queue) {
 			/* The sleep queue is slightly special... */
 			if (proc->timed_sleep_node) {
@@ -662,8 +645,8 @@ void make_process_ready(volatile process_t * proc) {
 			__sync_or_and_fetch(&proc->flags, PROC_FLAG_SLEEP_INT);
 			list_delete((list_t*)proc->sleep_node.owner, (node_t*)&proc->sleep_node);
 		}
-		if (!sleep_lock_is_mine) spin_unlock(sleep_lock);
 	}
+	if (!sleep_lock_is_mine) spin_unlock(sleep_lock);
 
 	spin_lock(process_queue_lock);
 	if (proc->sched_node.owner) {
@@ -722,7 +705,10 @@ volatile process_t * next_ready_process(void) {
 
 	spin_unlock(process_queue_lock);
 
-	__sync_or_and_fetch(&next->flags, PROC_FLAG_RUNNING);
+	if (!(next->flags & PROC_FLAG_FINISHED)) {
+		__sync_or_and_fetch(&next->flags, PROC_FLAG_RUNNING);
+	}
+
 	next->owner = this_core->cpu_id;
 
 	return next;
@@ -751,9 +737,11 @@ int wakeup_queue(list_t * queue) {
 	spin_lock(wait_lock_tmp);
 	while (queue->length > 0) {
 		node_t * node = list_pop(queue);
+		spin_unlock(wait_lock_tmp);
 		if (!(((process_t *)node->value)->flags & PROC_FLAG_FINISHED)) {
 			make_process_ready(node->value);
 		}
+		spin_lock(wait_lock_tmp);
 		awoken_processes++;
 	}
 	spin_unlock(wait_lock_tmp);
@@ -775,11 +763,29 @@ int wakeup_queue_interrupted(list_t * queue) {
 	spin_lock(wait_lock_tmp);
 	while (queue->length > 0) {
 		node_t * node = list_pop(queue);
+		spin_unlock(wait_lock_tmp);
 		if (!(((process_t *)node->value)->flags & PROC_FLAG_FINISHED)) {
 			process_t * proc = node->value;
 			__sync_or_and_fetch(&proc->flags, PROC_FLAG_SLEEP_INT);
 			make_process_ready(proc);
 		}
+		spin_lock(wait_lock_tmp);
+		awoken_processes++;
+	}
+	spin_unlock(wait_lock_tmp);
+	return awoken_processes;
+}
+
+int wakeup_queue_one(list_t * queue) {
+	int awoken_processes = 0;
+	spin_lock(wait_lock_tmp);
+	if (queue->length > 0) {
+		node_t * node = list_pop(queue);
+		spin_unlock(wait_lock_tmp);
+		if (!(((process_t *)node->value)->flags & PROC_FLAG_FINISHED)) {
+			make_process_ready(node->value);
+		}
+		spin_lock(wait_lock_tmp);
 		awoken_processes++;
 	}
 	spin_unlock(wait_lock_tmp);
@@ -849,9 +855,7 @@ void wakeup_sleepers(unsigned long seconds, unsigned long subseconds) {
 				process->sleep_node.owner = NULL;
 				process->timed_sleep_node = NULL;
 				if (!process_is_ready(process)) {
-					spin_lock(wait_lock_tmp);
 					make_process_ready(process);
-					spin_unlock(wait_lock_tmp);
 				}
 			}
 			free(proc);
@@ -1140,9 +1144,7 @@ int process_awaken_from_fswait(process_t * process, int index) {
 	}
 	process->timeout_node = NULL;
 
-	spin_lock(wait_lock_tmp);
 	make_process_ready(process);
-	spin_unlock(wait_lock_tmp);
 	spin_unlock(process->sched_lock);
 	return 0;
 }
@@ -1162,7 +1164,9 @@ int process_alert_node_locked(process_t * process, void * value) {
 	must_have_lock(sleep_lock);
 
 	if (!is_valid_process(process)) {
-		printf("invalid process\n");
+		dprintf("core %d (pid=%d %s) attempted to alert invalid process %#zx\n",
+			this_core->cpu_id, this_core->current_process->id, this_core->current_process->name,
+			(uintptr_t)process);
 		return 0;
 	}
 
@@ -1285,7 +1289,7 @@ void task_exit(int retval) {
 }
 
 #define PUSH(stack, type, item) stack -= sizeof(type); \
-							*((type *) stack) = item
+							*((volatile type *) stack) = item
 
 pid_t fork(void) {
 	uintptr_t sp, bp;
@@ -1304,11 +1308,24 @@ pid_t fork(void) {
 
 	arch_syscall_return(&r, 0);
 	PUSH(sp, struct regs, r);
+
 	new_proc->syscall_registers = (void*)sp;
 	new_proc->thread.context.sp = sp;
 	new_proc->thread.context.bp = bp;
 	new_proc->thread.context.tls_base = parent->thread.context.tls_base;
 	new_proc->thread.context.ip = (uintptr_t)&arch_resume_user;
+	arch_save_context(&parent->thread);
+	memcpy(new_proc->thread.context.saved, parent->thread.context.saved, sizeof(parent->thread.context.saved));
+
+	#if 0
+	printf("fork(): resuming with register context\n");
+	extern void aarch64_regs(struct regs *);
+	aarch64_regs(&r);
+	printf("fork(): and arch context:\n");
+	extern void aarch64_context(process_t * proc);
+	aarch64_context(new_proc);
+	#endif
+
 	if (parent->flags & PROC_FLAG_IS_TASKLET) new_proc->flags |= PROC_FLAG_IS_TASKLET;
 	make_process_ready(new_proc);
 	return new_proc->id;
@@ -1337,13 +1354,24 @@ pid_t clone(uintptr_t new_stack, uintptr_t thread_func, uintptr_t arg) {
 	}
 
 	/* different calling convention */
+	#if defined(__x86_64__)
 	r.rdi = arg;
-	PUSH(new_stack, uintptr_t, (uintptr_t)0xFFFFB00F);
+	PUSH(new_stack, uintptr_t, (uintptr_t)0);
+	#elif defined(__aarch64__)
+	r.x0 = arg;
+	r.x30 = 0;
+	#endif
 	PUSH(sp, struct regs, r);
 	new_proc->syscall_registers = (void*)sp;
+	#if defined(__x86_64__)
 	new_proc->syscall_registers->rsp = new_stack;
 	new_proc->syscall_registers->rbp = new_stack;
 	new_proc->syscall_registers->rip = thread_func;
+	#elif defined(__aarch64__)
+	new_proc->syscall_registers->user_sp = new_stack;
+	new_proc->syscall_registers->x29 = new_stack;
+	new_proc->thread.context.saved[10] = thread_func;
+	#endif
 	new_proc->thread.context.sp = sp;
 	new_proc->thread.context.bp = bp;
 	new_proc->thread.context.tls_base = this_core->current_process->thread.context.tls_base;

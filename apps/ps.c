@@ -1,14 +1,16 @@
-/* vim: tabstop=4 shiftwidth=4 noexpandtab
+/**
+ * @brief Print a list of running processes.
+ *
+ * The listed processes are limited to ones owned by the current
+ * user and are listed in PID order. Various options allow for
+ * threads to be shown separately, extra information to be
+ * included in the output, etc.
+ *
+ * @copyright
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2013-2018 K. Lange
- *
- * ps
- *
- * print a list of running processes
+ * Copyright (C) 2013-2021 K. Lange
  */
-
-
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -29,9 +31,10 @@ static int show_threads = 0;
 static int show_username = 0;
 static int show_mem = 0;
 static int show_cpu = 0;
+static int show_time = 0;
 static int collect_commandline = 0;
 
-static int widths[] = {3,3,4,3,3,4,4};
+static int widths[] = {3,3,4,3,3,4,4,4};
 
 struct process {
 	int uid;
@@ -41,6 +44,7 @@ struct process {
 	int vsz;
 	int shm;
 	int cpu;
+	unsigned long time;
 	char * process;
 	char * command_line;
 };
@@ -69,6 +73,7 @@ struct process * process_entry(struct dirent *dent) {
 	char line[LINE_LEN];
 
 	int pid = 0, uid = 0, tgid = 0, mem = 0, shm = 0, vsz = 0, cpu = 0;
+	unsigned long ttime = 0;
 	char name[100];
 
 	sprintf(tmp, "/proc/%s/status", dent->d_name);
@@ -104,6 +109,8 @@ struct process * process_entry(struct dirent *dent) {
 			mem = atoi(tab);
 		} else if (strstr(line, "CpuPermille:") == line) {
 			cpu = atoi(tab);
+		} else if (strstr(line, "TotalTime:") == line) {
+			ttime = strtoul(tab,NULL,0);
 		}
 	}
 
@@ -120,6 +127,7 @@ struct process * process_entry(struct dirent *dent) {
 			struct process * parent = process_from_pid(tgid);
 			if (parent) {
 				parent->cpu += cpu;
+				parent->time += ttime;
 			}
 			return NULL;
 		}
@@ -133,6 +141,7 @@ struct process * process_entry(struct dirent *dent) {
 	out->shm = shm;
 	out->vsz = vsz;
 	out->cpu = cpu;
+	out->time = ttime;
 	out->process = strdup(name);
 	out->command_line = NULL;
 
@@ -147,6 +156,10 @@ struct process * process_entry(struct dirent *dent) {
 	if ((len = sprintf(garbage, "%d", out->shm)) > widths[4]) widths[4] = len;
 	if ((len = sprintf(garbage, "%d.%01d", out->mem / 10, out->mem % 10)) > widths[5]) widths[5] = len;
 	if ((len = sprintf(garbage, "%d.%01d", out->cpu / 10, out->cpu % 10)) > widths[6]) widths[6] = len;
+	if ((len = sprintf(garbage, "%lu:%02lu.%02lu",
+		(out->time / (1000000UL * 60 * 60)),
+		(out->time / (1000000UL * 60)) % 60,
+		(out->time / (1000000UL)) % 60)) > widths[7]) widths[7] = len;
 
 	struct passwd * p = getpwuid(out->uid);
 	if (p) {
@@ -195,6 +208,9 @@ void print_header(void) {
 		printf("%*s ", widths[3], "VSZ");
 		printf("%*s ", widths[4], "SHM");
 	}
+	if (show_time) {
+		printf("%*s ", widths[7], "TIME");
+	}
 	printf("CMD\n");
 }
 
@@ -224,6 +240,15 @@ void print_entry(struct process * out) {
 		printf("%*d ", widths[3], out->vsz);
 		printf("%*d ", widths[4], out->shm);
 	}
+	if (show_time) {
+		char tmp[30];
+		sprintf(tmp, "%lu:%02lu.%02lu",
+		(out->time / (1000000UL * 60 * 60)),
+		(out->time / (1000000UL * 60)) % 60,
+		(out->time / (1000000UL)) % 60);
+
+		printf("%*s ", widths[7], tmp);
+	}
 	if (out->command_line) {
 		printf("%s\n", out->command_line);
 	} else {
@@ -251,7 +276,7 @@ void show_usage(int argc, char * argv[]) {
 int main (int argc, char * argv[]) {
 
 	/* Parse arguments */
-	char c;
+	int c;
 	while ((c = getopt(argc, argv, "AT?")) != -1) {
 		switch (c) {
 			case 'A':
@@ -274,6 +299,7 @@ int main (int argc, char * argv[]) {
 					show_username = 1;
 					show_mem = 1;
 					show_cpu = 1;
+					show_time = 1;
 					// fallthrough
 				case 'a':
 					collect_commandline = 1;
@@ -315,8 +341,3 @@ int main (int argc, char * argv[]) {
 	return 0;
 }
 
-/*
- * vim: tabstop=4
- * vim: shiftwidth=4
- * vim: noexpandtab
- */

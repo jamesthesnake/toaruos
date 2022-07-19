@@ -1,3 +1,17 @@
+/**
+ * @file modules/test.c
+ * @brief Test module.
+ * @package x86_64
+ * @package aarch64
+ *
+ * Load with various arguments to do things like crash the
+ * kernel or print tracebacks.
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2021 K. Lange
+ */
 #include <kernel/printf.h>
 #include <kernel/module.h>
 #include <kernel/assert.h>

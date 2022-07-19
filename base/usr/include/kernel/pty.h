@@ -38,9 +38,10 @@ typedef struct pty {
 
 	void (*fill_name)(struct pty *, char *);
 
+	void * _private;
 } pty_t;
 
 void tty_output_process_slave(pty_t * pty, uint8_t c);
 void tty_output_process(pty_t * pty, uint8_t c);
 void tty_input_process(pty_t * pty, uint8_t c);
-pty_t * pty_new(struct winsize * size);
+pty_t * pty_new(struct winsize * size, int index);

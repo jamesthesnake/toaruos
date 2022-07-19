@@ -1,6 +1,3 @@
-/* vim: tabstop=4 shiftwidth=4 noexpandtab
- * 
- */
 ENTRY(_start)
 
 SECTIONS
@@ -36,6 +33,7 @@ SECTIONS
 
 	.init_array : {
 		PROVIDE_HIDDEN (__init_array_start = .);
+		*(.init_array);
 		PROVIDE_HIDDEN (__init_array_end = .);
 	}
 

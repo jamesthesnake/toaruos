@@ -6,6 +6,11 @@
  * loads static binaries; for dynamic binaries, the requested interpreter
  * is loaded, which should generally be /lib/ld.so, which should itself
  * be a static binary. This loader is platform-generic.
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2021 K. Lange
  */
 #include <errno.h>
 #include <kernel/types.h>
@@ -20,14 +25,38 @@
 #include <kernel/ksym.h>
 #include <kernel/module.h>
 #include <kernel/hashmap.h>
+#include <kernel/mutex.h>
 
-static hashmap_t * _modules_table = NULL;
+hashmap_t * _modules_table = NULL;
+sched_mutex_t * _modules_mutex = NULL;
+
+void modules_install(void) {
+	_modules_table = hashmap_create(10);
+	_modules_mutex = mutex_init("module loader");
+}
 
 hashmap_t * modules_get_list(void) {
 	return _modules_table;
 }
 
+/**
+ * Encode immediate for ADR(p) instruction
+ */
+static uint32_t aarch64_imm_adr(uint32_t val) {
+	uint32_t low  = (val & 0x3) << 29;
+	uint32_t high = ((val >> 2) & 0x7ffff) << 5;
+	return low | high;
+}
+
+/**
+ * Encode immediate for 12-bit instructions
+ */
+static uint32_t aarch64_imm_12(uint32_t val) {
+	return (val & 0xFFF) << 10;
+}
+
 int elf_module(char ** args) {
+	int error = 0;
 	Elf64_Header header;
 
 	fs_node_t * file = kopen(args[0],0);
@@ -49,13 +78,17 @@ int elf_module(char ** args) {
 
 	if (header.e_ident[EI_CLASS] != ELFCLASS64) {
 		printf("(Wrong Elf class)\n");
+		close_fs(file);
 		return -EINVAL;
 	}
 
 	if (header.e_type != ET_REL) {
 		printf("(Not a relocatable object)\n");
+		close_fs(file);
 		return -EINVAL;
 	}
+
+	mutex_acquire(_modules_mutex);
 
 	/* Just slap the whole thing into memory, why not... */
 	char * module_load_address = mmu_map_module(file->length);
@@ -82,6 +115,11 @@ int elf_module(char ** args) {
 			memset((void*)sectionHeader->sh_addr, 0, sectionHeader->sh_size);
 		} else {
 			sectionHeader->sh_addr = (uintptr_t)(module_load_address + sectionHeader->sh_offset);
+			if (sectionHeader->sh_addralign &&
+				(sectionHeader->sh_addr & (sectionHeader->sh_addralign -1))) {
+				dprintf("mod: probably not aligned correctly: %#zx %ld\n",
+					sectionHeader->sh_addr, sectionHeader->sh_addralign);
+			}
 		}
 	}
 
@@ -108,8 +146,10 @@ int elf_module(char ** args) {
 			if (symTable[sym].st_shndx > 0 && symTable[sym].st_shndx < SHN_LOPROC) {
 				Elf64_Shdr * sh_hdr = (Elf64_Shdr*)(module_load_address + header.e_shoff + header.e_shentsize * symTable[sym].st_shndx);
 				symTable[sym].st_value = symTable[sym].st_value + sh_hdr->sh_addr;
+				// dprintf("mod: bind local symbol '%s' to %#zx\n", symTable[sym].st_name ? (symNames + symTable[sym].st_name) : "(unnamed)", symTable[sym].st_value);
 			} else if (symTable[sym].st_shndx == SHN_UNDEF) {
 				symTable[sym].st_value = (uintptr_t)ksym_lookup(symNames + symTable[sym].st_name);
+				// dprintf("mod: bind kernel symbol '%s' to %#zx\n", symTable[sym].st_name ? (symNames + symTable[sym].st_name) : "(unnamed)", symTable[sym].st_value);
 			}
 
 			if (symTable[sym].st_name && !strcmp(symNames + symTable[sym].st_name, "metadata")) {
@@ -119,8 +159,8 @@ int elf_module(char ** args) {
 	}
 
 	if (!moduleData) {
-		printf("No module data, bailing.\n");
-		return -EINVAL;
+		error = EINVAL;
+		goto _unmap_module;
 	}
 
 	for (unsigned int i = 0; i < header.e_shnum; ++i) {
@@ -136,27 +176,62 @@ int elf_module(char ** args) {
 		Elf64_Shdr * symbolSection = (Elf64_Shdr*)(module_load_address + header.e_shoff + header.e_shentsize * sectionHeader->sh_link);
 		Elf64_Sym * symbolTable = (Elf64_Sym *)symbolSection->sh_addr;
 
+#define S (symbolTable[ELF64_R_SYM(table[rela].r_info)].st_value)
+#define A (table[rela].r_addend)
+#define T32 (*(uint32_t*)target)
+#define T64 (*(uint64_t*)target)
+#define P  (target)
+
 		for (unsigned int rela = 0; rela < sectionHeader->sh_size / sizeof(Elf64_Rela); ++rela) {
 			uintptr_t target = table[rela].r_offset + targetSection->sh_addr;
 			switch (ELF64_R_TYPE(table[rela].r_info)) {
+#if defined(__x86_64__)
 				case R_X86_64_64:
-					*(uint64_t*)target = symbolTable[ELF64_R_SYM(table[rela].r_info)].st_value + table[rela].r_addend;
+					T64 = S + A;
 					break;
 				case R_X86_64_32:
-					*(uint32_t*)target = symbolTable[ELF64_R_SYM(table[rela].r_info)].st_value + table[rela].r_addend;
+					T32 = S + A;
 					break;
 				case R_X86_64_PC32:
-					*(uint32_t*)target = symbolTable[ELF64_R_SYM(table[rela].r_info)].st_value + table[rela].r_addend - target;
+					T32 = S + A - P;
 					break;
+#elif defined(__aarch64__)
+				case 275: { /* R_AARCH64_ADR_PREL_PG_HI21 */
+					T32 = T32 | aarch64_imm_adr( ((S + A) >> 12) - (P >> 12) );
+					break;
+				}
+				case 286: /* R_AARCH64_LDST64_ABS_LO12_NC */
+					T32 = T32 | aarch64_imm_12( ((S + A) >> 3) & 0x1FF );
+					break;
+				case 282: /* R_AARCH64_JUMP26 */
+				case 283: /* R_AARCH64_CALL26 */
+					T32 = T32 | (((S + A - P) >> 2) & 0x3ffffff);
+					break;
+				case 257: /* ABS64 */
+					T64 = S + A;
+					break;
+				case 258: /* ABS32 */
+					T32 = S + A;
+					break;
+#endif
 				default:
-					printf("Unsupported relocation: %ld\n", ELF64_R_TYPE(table[rela].r_info));
-					return -EINVAL;
+					dprintf("mod: unsupported relocation %ld found\n", ELF64_R_TYPE(table[rela].r_info));
+					error = EINVAL;
 			}
 		}
 	}
 
-	if (!_modules_table) {
-		_modules_table = hashmap_create(10);
+#undef S
+#undef A
+#undef T32
+#undef T64
+#undef P
+
+	if (error) goto _unmap_module;
+
+	if (hashmap_has(_modules_table, moduleData->name)) {
+		error = EEXIST;
+		goto _unmap_module;
 	}
 
 	struct LoadedModule * loadedData = malloc(sizeof(struct LoadedModule));
@@ -168,12 +243,21 @@ int elf_module(char ** args) {
 	close_fs(file);
 
 	hashmap_set(_modules_table, moduleData->name, loadedData);
+	mutex_release(_modules_mutex);
 
 	/* Count arguments */
 	int argc = 0;
 	for (char ** aa = args; *aa; ++aa) ++argc;
 
 	return moduleData->init(argc, args);
+
+_unmap_module:
+	close_fs(file);
+
+	mmu_unmap_module((uintptr_t)module_load_address, (uintptr_t)mmu_map_module(0) - (uintptr_t)module_load_address);
+
+	mutex_release(_modules_mutex);
+	return -error;
 }
 
 int elf_exec(const char * path, fs_node_t * file, int argc, const char *const argv[], const char *const env[], int interp) {
@@ -255,6 +339,11 @@ int elf_exec(const char * path, fs_node_t * file, int argc, const char *const ar
 				*(char*)(phdr.p_vaddr + i) = 0;
 			}
 
+			#ifdef __aarch64__
+			extern void arch_clear_icache(uintptr_t,uintptr_t);
+			arch_clear_icache(phdr.p_vaddr, phdr.p_vaddr + phdr.p_memsz);
+			#endif
+
 			if (phdr.p_vaddr + phdr.p_memsz > heapBase) {
 				heapBase = phdr.p_vaddr + phdr.p_memsz;
 			}
@@ -275,7 +364,7 @@ int elf_exec(const char * path, fs_node_t * file, int argc, const char *const ar
 
 	/* Map stack space */
 	uintptr_t userstack = 0x800000000000;
-	for (uintptr_t i = userstack - 16 * 0x400; i < userstack; i += 0x1000) {
+	for (uintptr_t i = userstack - 512 * 0x400; i < userstack; i += 0x1000) {
 		union PML * page = mmu_get_page(i, MMU_GET_MAKE);
 		mmu_frame_allocate(page, MMU_FLAG_WRITABLE);
 	}
