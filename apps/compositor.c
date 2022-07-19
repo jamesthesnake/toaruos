@@ -1,9 +1,5 @@
-/* vim: tabstop=4 shiftwidth=4 noexpandtab
- * This file is part of ToaruOS and is released under the terms
- * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2013-2018 K. Lange
- *
- * Yutani - The ToaruOS Compositor.
+/**
+ * @brief Yutani - The ToaruOS Window Compositor.
  *
  * Yutani is a canvas-based window compositor and manager.
  * It employs shared memory to provide clients access to
@@ -13,6 +9,11 @@
  * to client events, etc., as well as to communicate requests from
  * the client to the server, such as creation of new windows,
  * movement, resizing, and display updates.
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2013-2018 K. Lange
  */
 #include <stdio.h>
 #include <stdint.h>
@@ -57,6 +58,8 @@ static void mark_window(yutani_globals_t * yg, yutani_server_window_t * window);
 static void window_actually_close(yutani_globals_t * yg, yutani_server_window_t * w);
 static void notify_subscribers(yutani_globals_t * yg);
 static void mouse_stop_drag(yutani_globals_t * yg);
+static void window_move(yutani_globals_t * yg, yutani_server_window_t * window, int x, int y);
+static yutani_server_window_t * top_at(yutani_globals_t * yg, uint16_t x, uint16_t y);
 
 /**
  * Print usage information.
@@ -213,6 +216,20 @@ void yutani_window_to_device(yutani_server_window_t * window, int32_t x, int32_t
 	*out_y = (int32_t)(n_y + ((double)window->height / 2) + (double)window->y);
 }
 
+static list_t * window_zorder_owner(yutani_globals_t * yg, unsigned short index) {
+	switch (index) {
+		case YUTANI_ZORDER_BOTTOM:
+		case YUTANI_ZORDER_TOP:
+			return NULL;
+		case YUTANI_ZORDER_MENU:
+			return yg->menu_zs;
+		case YUTANI_ZORDER_OVERLAY:
+			return yg->overlay_zs;
+		default:
+			return yg->mid_zs;
+	}
+}
+
 /**
  * Remove a window from the z stack.
  */
@@ -227,17 +244,12 @@ static void unorder_window(yutani_globals_t * yg, yutani_server_window_t * w) {
 		yg->top_z = NULL;
 		return;
 	}
-	if (index == YUTANI_ZORDER_OVERLAY) {
-		node_t * n = list_find(yg->overlay_zs, w);
-		if (!n) return;
-		list_delete(yg->overlay_zs, n);
-		free(n);
-	} else {
-		node_t * n = list_find(yg->mid_zs, w);
-		if (!n) return;
-		list_delete(yg->mid_zs, n);
-		free(n);
-	}
+
+	list_t * zorder_owner = window_zorder_owner(yg, index);
+	node_t * n = list_find(zorder_owner, w);
+	if (!n) return;
+	list_delete(zorder_owner, n);
+	free(n);
 }
 
 /**
@@ -252,12 +264,9 @@ static void reorder_window(yutani_globals_t * yg, yutani_server_window_t * windo
 
 	window->z = new_zed;
 
-	if (new_zed != YUTANI_ZORDER_TOP && new_zed != YUTANI_ZORDER_BOTTOM) {
-		if (new_zed == YUTANI_ZORDER_OVERLAY) {
-			list_insert(yg->overlay_zs, window);
-		} else {
-			list_insert(yg->mid_zs, window);
-		}
+	list_t * zorder_owner = window_zorder_owner(yg, new_zed);
+	if (zorder_owner) {
+		list_insert(zorder_owner, window);
 		return;
 	}
 
@@ -279,20 +288,18 @@ static void reorder_window(yutani_globals_t * yg, yutani_server_window_t * windo
 }
 
 /**
- * Move a window to the top of the basic z stack, if valid.
+ * Move a window to the top of if its z stack.
  */
 static void make_top(yutani_globals_t * yg, yutani_server_window_t * w) {
 	unsigned short index = w->z;
+	list_t * zorder_owner = window_zorder_owner(yg, index);
+	if (!zorder_owner) return;
 
-	if (index == YUTANI_ZORDER_BOTTOM) return;
-	if (index == YUTANI_ZORDER_TOP) return;
-	if (index == YUTANI_ZORDER_OVERLAY) return;
-
-	node_t * n = list_find(yg->mid_zs, w);
+	node_t * n = list_find(zorder_owner, w);
 	if (!n) return; /* wat */
 
-	list_delete(yg->mid_zs, n);
-	list_append(yg->mid_zs, n);
+	list_delete(zorder_owner, n);
+	list_append(zorder_owner, n);
 }
 
 /**
@@ -468,6 +475,34 @@ static void server_window_resize_finish(yutani_globals_t * yg, yutani_server_win
 
 	mark_window(yg, win);
 
+	if (yg->resizing_window == win) {
+		yg->resize_release_time = 0;
+		if (yg->mouse_state == YUTANI_MOUSE_STATE_NORMAL) {
+			int32_t x, y;
+			if (yg->resizing_window->rotation) {
+				/* If the window is rotated, we need to move the center to be where the new center should be, but x/y are based on the unrotated upper left corner. */
+				/* The center always moves by one-half the resize dimensions */
+				int32_t center_x, center_y;
+				yutani_server_window_t fake_window = {
+					.width = yg->resizing_init_w,
+					.height = yg->resizing_init_h,
+					.x = yg->resizing_window->x,
+					.y = yg->resizing_window->y,
+					.rotation = yg->resizing_window->rotation,
+				};
+				yutani_window_to_device(&fake_window, yg->resizing_offset_x + yg->resizing_w / 2, yg->resizing_offset_y + yg->resizing_h / 2, &center_x, &center_y);
+				x = center_x - yg->resizing_w / 2;
+				y = center_y - yg->resizing_h / 2;
+			} else {
+				yutani_window_to_device(yg->resizing_window, yg->resizing_offset_x, yg->resizing_offset_y, &x, &y);
+			}
+			TRACE("resize complete, now %d x %d", yg->resizing_w, yg->resizing_h);
+			window_move(yg, yg->resizing_window, x,y);
+			yg->resizing_window = NULL;
+			yg->mouse_window = NULL;
+		}
+	}
+
 	win->width = width;
 	win->height = height;
 
@@ -552,7 +587,15 @@ static void draw_cursor(yutani_globals_t * yg, int x, int y, int cursor) {
 		}
 	}
 
-	draw_sprite(yg->backend_ctx, sprite, x / MOUSE_SCALE - MOUSE_OFFSET_X, y / MOUSE_SCALE - MOUSE_OFFSET_Y);
+	yutani_server_window_t * cursor_window = yg->resizing_window ? yg->resizing_window :
+		top_at(yg, yg->mouse_x / MOUSE_SCALE, yg->mouse_y / MOUSE_SCALE);
+	int16_t rotation = cursor_window ? cursor_window->rotation : 0;
+
+	if (rotation) {
+		draw_sprite_rotate(yg->backend_ctx, sprite, x / MOUSE_SCALE - MOUSE_OFFSET_X, y / MOUSE_SCALE - MOUSE_OFFSET_Y, (double)rotation * M_PI / 180.0, 1.0);
+	} else {
+		draw_sprite(yg->backend_ctx, sprite, x / MOUSE_SCALE - MOUSE_OFFSET_X, y / MOUSE_SCALE - MOUSE_OFFSET_Y);
+	}
 }
 
 /**
@@ -588,6 +631,10 @@ static yutani_server_window_t * check_top_at(yutani_globals_t * yg, yutani_serve
  */
 static yutani_server_window_t * top_at(yutani_globals_t * yg, uint16_t x, uint16_t y) {
 	if (check_top_at(yg, yg->top_z, x, y)) return yg->top_z;
+	foreachr(node, yg->menu_zs) {
+		yutani_server_window_t * w = node->value;
+		if (check_top_at(yg, w, x, y)) return w;
+	}
 	foreachr(node, yg->overlay_zs) {
 		yutani_server_window_t * w = node->value;
 		if (check_top_at(yg, w, x, y)) return w;
@@ -689,13 +736,12 @@ static int yutani_blit_window(yutani_globals_t * yg, yutani_server_window_t * wi
 		gfx_matrix_identity(m);
 		gfx_matrix_translate(m,x,y);
 
-		if (window->rotation) {
-			gfx_matrix_translate(m, window->width / 2, window->height / 2);
-			gfx_matrix_rotate(m, (double)window->rotation * M_PI / 180.0);
-			gfx_matrix_translate(m, -window->width / 2, -window->height / 2);
-		}
-
 		if (window == yg->resizing_window) {
+			if (window->rotation) {
+				gfx_matrix_translate(m, yg->resizing_init_w / 2, yg->resizing_init_h / 2);
+				gfx_matrix_rotate(m, (double)window->rotation * M_PI / 180.0);
+				gfx_matrix_translate(m, -yg->resizing_init_w / 2, -yg->resizing_init_h / 2);
+			}
 			double x_scale = (double)yg->resizing_w / (double)yg->resizing_window->width;
 			double y_scale = (double)yg->resizing_h / (double)yg->resizing_window->height;
 			if (x_scale < 0.00001) {
@@ -706,7 +752,12 @@ static int yutani_blit_window(yutani_globals_t * yg, yutani_server_window_t * wi
 			}
 			gfx_matrix_translate(m, (int)yg->resizing_offset_x, (int)yg->resizing_offset_y);
 			gfx_matrix_scale(m, x_scale, y_scale);
+		} else if (window->rotation) {
+			gfx_matrix_translate(m, window->width / 2, window->height / 2);
+			gfx_matrix_rotate(m, (double)window->rotation * M_PI / 180.0);
+			gfx_matrix_translate(m, -window->width / 2, -window->height / 2);
 		}
+
 
 		if (window->anim_mode) {
 			int frame = yutani_time_since(yg, window->anim_start);
@@ -753,7 +804,7 @@ static int yutani_blit_window(yutani_globals_t * yg, yutani_server_window_t * wi
 			}
 		}
 		if (matrix_is_translation(m)) {
-			draw_sprite_alpha(yg->backend_ctx, &_win_sprite, window->x, window->y, opacity);
+			draw_sprite_alpha(yg->backend_ctx, &_win_sprite, m[0][2], m[1][2], opacity);
 		} else {
 			draw_sprite_transform(yg->backend_ctx, &_win_sprite, m, opacity);
 		}
@@ -814,6 +865,12 @@ static void yutani_post_vbox_rects(yutani_globals_t * yg) {
 		DO_WINDOW(w);
 	}
 
+	/* Add menu windows */
+	foreach (node, yg->menu_zs) {
+		yutani_server_window_t * w = node->value;
+		DO_WINDOW(w);
+	}
+
 	/*
 	 * If there were no windows, show the whole desktop
 	 * so we can see, eg., the login screen.
@@ -845,6 +902,10 @@ static void yutani_blit_windows(yutani_globals_t * yg) {
 		if (w) yutani_blit_window(yg, w, w->x, w->y);
 	}
 	foreach (node, yg->overlay_zs) {
+		yutani_server_window_t * w = node->value;
+		if (w) yutani_blit_window(yg, w, w->x, w->y);
+	}
+	foreach (node, yg->menu_zs) {
 		yutani_server_window_t * w = node->value;
 		if (w) yutani_blit_window(yg, w, w->x, w->y);
 	}
@@ -966,6 +1027,19 @@ static void redraw_windows(yutani_globals_t * yg) {
 		resize_display(yg);
 	}
 
+	if (yg->resizing_window &&
+		yg->mouse_state == YUTANI_MOUSE_STATE_NORMAL &&
+		yg->resize_release_time &&
+		yutani_time_since(yg, yg->resize_release_time) >= 500) {
+
+		yutani_server_window_t * resizing = yg->resizing_window;
+		mark_window(yg, resizing);
+		yg->resize_release_time = 0;
+		yg->resizing_window = NULL;
+		yg->mouse_window = NULL;
+		mark_window(yg, resizing);
+	}
+
 	gfx_clear_clip(yg->backend_ctx);
 
 	/* If the mouse has moved, that counts as two damage regions */
@@ -985,6 +1059,10 @@ static void redraw_windows(yutani_globals_t * yg) {
 		if (w && w->anim_mode) mark_window(yg, w);
 	}
 	foreach (node, yg->overlay_zs) {
+		yutani_server_window_t * w = node->value;
+		if (w && w->anim_mode) mark_window(yg, w);
+	}
+	foreach (node, yg->menu_zs) {
 		yutani_server_window_t * w = node->value;
 		if (w && w->anim_mode) mark_window(yg, w);
 	}
@@ -1113,8 +1191,15 @@ void yutani_clip_init(yutani_globals_t * yg) {
  */
 static void mark_window_relative(yutani_globals_t * yg, yutani_server_window_t * window, int32_t x, int32_t y, int32_t width, int32_t height) {
 	yutani_damage_rect_t * rect = malloc(sizeof(yutani_damage_rect_t));
+	yutani_server_window_t fake_window;
 
 	if (window == yg->resizing_window) {
+		fake_window.width  = yg->resizing_init_w;
+		fake_window.height = yg->resizing_init_h;
+		fake_window.x = window->x;
+		fake_window.y = window->y;
+		fake_window.rotation = window->rotation;
+
 		double x_scale = (double)yg->resizing_w / (double)yg->resizing_window->width;
 		double y_scale = (double)yg->resizing_h / (double)yg->resizing_window->height;
 
@@ -1129,6 +1214,8 @@ static void mark_window_relative(yutani_globals_t * yg, yutani_server_window_t *
 
 		width += 2;
 		height += 2;
+
+		window = &fake_window;
 	}
 
 	if (window->rotation == 0) {
@@ -1217,7 +1304,9 @@ static void window_actually_close(yutani_globals_t * yg, yutani_server_window_t 
 	if (w == yg->focused_window) {
 		/* find the top z-ordered window */
 		yg->focused_window = NULL;
-		if (yg->mid_zs->tail && yg->mid_zs->tail->value) {
+		if (yg->menu_zs->tail && yg->menu_zs->tail->value) {
+			set_focused_window(yg, yg->menu_zs->tail->value);
+		} else if (yg->mid_zs->tail && yg->mid_zs->tail->value) {
 			set_focused_window(yg, yg->mid_zs->tail->value);
 		}
 	}
@@ -1684,6 +1773,8 @@ static void mouse_start_resize(yutani_globals_t * yg, yutani_scale_direction_t d
 			yg->resizing_h = yg->mouse_window->height;
 			yg->resizing_offset_x = 0;
 			yg->resizing_offset_y = 0;
+			yg->resizing_init_w = yg->mouse_window->width;
+			yg->resizing_init_h = yg->mouse_window->height;
 
 			if (direction == SCALE_AUTO) {
 				/* Determine the best direction to scale in based on simple 9-cell system. */
@@ -1913,8 +2004,16 @@ static void handle_mouse_event(yutani_globals_t * yg, struct yutani_msg_mouse_ev
 				int32_t relative_x, relative_y;
 				int32_t relative_init_x, relative_init_y;
 
-				yutani_device_to_window(yg->resizing_window, yg->mouse_init_x / MOUSE_SCALE, yg->mouse_init_y / MOUSE_SCALE, &relative_init_x, &relative_init_y);
-				yutani_device_to_window(yg->resizing_window, yg->mouse_x / MOUSE_SCALE, yg->mouse_y / MOUSE_SCALE, &relative_x, &relative_y);
+				yutani_server_window_t fake_window = {
+					.width = yg->resizing_init_w,
+					.height = yg->resizing_init_h,
+					.x = yg->resizing_window->x,
+					.y = yg->resizing_window->y,
+					.rotation = yg->resizing_window->rotation,
+				};
+
+				yutani_device_to_window(&fake_window, yg->mouse_init_x / MOUSE_SCALE, yg->mouse_init_y / MOUSE_SCALE, &relative_init_x, &relative_init_y);
+				yutani_device_to_window(&fake_window, yg->mouse_x / MOUSE_SCALE, yg->mouse_y / MOUSE_SCALE, &relative_x, &relative_y);
 
 				int width_diff  = (relative_x - relative_init_x);
 				int height_diff = (relative_y - relative_init_y);
@@ -1953,8 +2052,8 @@ static void handle_mouse_event(yutani_globals_t * yg, struct yutani_msg_mouse_ev
 					yg->resizing_offset_y = 0;
 				}
 
-				yg->resizing_w = yg->resizing_window->width + width_diff;
-				yg->resizing_h = yg->resizing_window->height + height_diff;
+				yg->resizing_w = yg->resizing_init_w + width_diff;
+				yg->resizing_h = yg->resizing_init_h + height_diff;
 
 				/* Enforce logical boundaries */
 				if (yg->resizing_w < 1) {
@@ -1963,34 +2062,23 @@ static void handle_mouse_event(yutani_globals_t * yg, struct yutani_msg_mouse_ev
 				if (yg->resizing_h < 1) {
 					yg->resizing_h = 1;
 				}
-				if (yg->resizing_offset_x > yg->resizing_window->width) {
-					yg->resizing_offset_x = yg->resizing_window->width;
+				if (yg->resizing_offset_x > yg->resizing_init_w) {
+					yg->resizing_offset_x = yg->resizing_init_w;
 				}
-				if (yg->resizing_offset_y > yg->resizing_window->height) {
-					yg->resizing_offset_y = yg->resizing_window->height;
+				if (yg->resizing_offset_y > yg->resizing_init_h) {
+					yg->resizing_offset_y = yg->resizing_init_h;
 				}
 
 				mark_window(yg, yg->resizing_window);
 
-				if (!(me->event.buttons & yg->resizing_button)) {
-					int32_t x, y;
-					if (yg->resizing_window->rotation) {
-						/* If the window is rotated, we need to move the center to be where the new center should be, but x/y are based on the unrotated upper left corner. */
-						/* The center always moves by one-half the resize dimensions */
-						int32_t center_x, center_y;
-						yutani_window_to_device(yg->resizing_window, yg->resizing_offset_x + yg->resizing_w / 2, yg->resizing_offset_y + yg->resizing_h / 2, &center_x, &center_y);
-						x = center_x - yg->resizing_w / 2;
-						y = center_y - yg->resizing_h / 2;
-					} else {
-						yutani_window_to_device(yg->resizing_window, yg->resizing_offset_x, yg->resizing_offset_y, &x, &y);
-					}
-					TRACE("resize complete, now %d x %d", yg->resizing_w, yg->resizing_h);
-					window_move(yg, yg->resizing_window, x,y);
+				if (!yg->resize_release_time || !(me->event.buttons & yg->resizing_button)) {
+					yg->resize_release_time = yutani_current_time(yg);
 					yutani_msg_buildx_window_resize_alloc(response);
 					yutani_msg_buildx_window_resize(response,YUTANI_MSG_RESIZE_OFFER, yg->resizing_window->wid, yg->resizing_w, yg->resizing_h, 0, yg->resizing_window->tiled);
 					pex_send(yg->server, yg->resizing_window->owner, response->size, (char *)response);
-					yg->resizing_window = NULL;
-					yg->mouse_window = NULL;
+				}
+
+				if (!(me->event.buttons & yg->resizing_button)) {
 					yg->mouse_state = YUTANI_MOUSE_STATE_NORMAL;
 				}
 			}
@@ -2152,12 +2240,14 @@ int main(int argc, char * argv[]) {
 	yg->key_binds = hashmap_create_int(10);
 	yg->clients_to_windows = hashmap_create_int(10);
 	yg->mid_zs = list_create();
+	yg->menu_zs = list_create();
 	yg->overlay_zs = list_create();
 	yg->windows_to_remove = list_create();
 
 	yg->window_subscribers = list_create();
 
 	yg->last_mouse_buttons = 0;
+	yg->resize_release_time = 0;
 	TRACE("Done.");
 
 	yutani_clip_init(yg);
@@ -2519,7 +2609,7 @@ int main(int argc, char * argv[]) {
 					foreach (node, yg->mid_zs) {
 						yutani_query_result(yg, p->source, node->value);
 					}
-					/* Exclude overlay windows? */
+					/* Exclude menus, overlay windows, top and bottom. */
 					yutani_query_result(yg, p->source, yg->top_z);
 					yutani_msg_buildx_window_advertise_alloc(response, 0);
 					yutani_msg_buildx_window_advertise(response,0, 0, 0, 0, 0, 0, 0, NULL);

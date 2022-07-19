@@ -131,7 +131,7 @@ static int release_chunk (shm_chunk_t * chunk) {
 
 			/* First, free the frames used by this chunk */
 			for (uint32_t i = 0; i < chunk->num_frames; i++) {
-				mmu_frame_clear(chunk->frames[i] << 12);
+				mmu_frame_release(chunk->frames[i] << 12);
 			}
 
 			/* Then, get rid of the damn thing */
@@ -171,7 +171,7 @@ static void * map_in (shm_chunk_t * chunk, volatile process_t * volatile proc) {
 	mapping->num_vaddrs = chunk->num_frames;
 	mapping->vaddrs = malloc(sizeof(uintptr_t) * mapping->num_vaddrs);
 
-	uintptr_t last_address = 0x200000000;
+	uintptr_t last_address = USER_SHM_LOW;
 	foreach(node, proc->shm_mappings) {
 		shm_mapping_t * m = node->value;
 		if (m->vaddrs[0] > last_address) {

@@ -1,9 +1,5 @@
-/* vim: ts=4 sw=4 noexpandtab
- * This file is part of ToaruOS and is released under the terms
- * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2018 K. Lange
- *
- * msk - Package Management Utility for ToaruOS
+/**
+ * @brief Package Management Utility for ToaruOS
  *
  * This is a not-quite-faithful reconstruction of the original
  * Python msk. The supported package format is a bit different,
@@ -11,6 +7,11 @@
  *
  * Packages can optionally be uncompressed, which is also
  * important for bootstrapping at the moment.
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2018 K. Lange
  */
 #include <stdio.h>
 #include <string.h>
@@ -173,6 +174,11 @@ static int update_stores(int argc, char * argv[]) {
 		return usage(argc,argv);
 	}
 
+	const char * manifest_prefix = "";
+#ifdef __aarch64__
+	manifest_prefix = "aarch64.";
+#endif
+
 	needs_lock();
 
 	read_config();
@@ -206,7 +212,7 @@ static int update_stores(int argc, char * argv[]) {
 			}
 		} else {
 			char cmd[512];
-			sprintf(cmd, "fetch -vo /tmp/.msk_remote_%s %s/manifest", remote_name, remote_path);
+			sprintf(cmd, "fetch -vo /tmp/.msk_remote_%s %s/%smanifest", remote_name, remote_path, manifest_prefix);
 			fprintf(stderr, "Downloading remote manifest '%s'...\n", remote_name);
 			if (system(cmd)) {
 				fprintf(stderr, "Skipping unavailable remote manifest '%s' (%s).\n", remote_name, remote_path);

@@ -1,15 +1,16 @@
-/* vim: tabstop=4 shiftwidth=4 noexpandtab
- * This file is part of ToaruOS and is released under the terms
- * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2018-2020 K. Lange
- *
- * help-browser - Display documentation.
+/**
+ * @brief help-browser - Display documentation.
  *
  * This is a work-in-progress reimplementation of the help browser
  * from mainline ToaruOS. It is currently incomplete.
  *
  * Eventually, this should be a rich text document browser, almost
  * akin to a web browser. Right now it just says "Hello, world."
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2018-2020 K. Lange
  */
 #include <stdio.h>
 #include <unistd.h>
@@ -143,16 +144,13 @@ static int parser_open(struct markup_state * self, void * user, struct markup_ta
 	} else if (!strcmp(tag->name, "h1")) {
 		list_insert(state, (void*)(uintptr_t)current_state);
 		current_state |= (1 << 2);
+	} else if (!strcmp(tag->name, "mono")) {
+		list_insert(state, (void*)(uintptr_t)current_state);
+		current_state |= (1 << 3);
 	} else if (!strcmp(tag->name, "br")) {
 		write_buffer();
 		cursor_x = BASE_X;
 		cursor_y += current_line_height();
-	} else if (!strcmp(tag->name, "mono")) {
-		write_buffer();
-		cursor_x = BASE_X;
-		cursor_y += current_line_height();
-		list_insert(state, (void*)(uintptr_t)current_state);
-		current_state |= (1 << 3);
 	}
 	markup_free_tag(tag);
 	return 0;
@@ -168,9 +166,6 @@ static int parser_close(struct markup_state * self, void * user, char * tag_name
 		current_state = (int)(uintptr_t)nstate->value;
 		free(nstate);
 	} else if (!strcmp(tag_name, "mono")) {
-		write_buffer();
-		cursor_x = BASE_X;
-		cursor_y += current_line_height();
 		node_t * nstate = list_pop(state);
 		current_state = (int)(uintptr_t)nstate->value;
 		free(nstate);

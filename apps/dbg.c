@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <signal.h>
+#include <ctype.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <sys/signal.h>
@@ -33,14 +34,8 @@ static FILE * binary_obj = NULL;
 static pid_t  binary_pid = 0;
 static int    binary_is_child = 0;
 
-struct regs {
-	uintptr_t r15, r14, r13, r12;
-	uintptr_t r11, r10, r9, r8;
-	uintptr_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
-	uintptr_t int_no, err_code;
-	uintptr_t rip, cs, rflags, rsp, ss;
-};
-
+#if defined(__x86_64__)
+#include <kernel/arch/x86_64/regs.h>
 static void dump_regs(struct regs * r) {
 	fprintf(stdout,
 		"  $rip=0x%016lx\n"
@@ -57,6 +52,42 @@ static void dump_regs(struct regs * r) {
 		r->cs, r->ss, r->rflags, r->int_no, r->err_code
 	);
 }
+#define regs_ip(regs) ((regs)->rip)
+#define regs_bp(regs) ((regs)->rbp)
+#elif defined(__aarch64__)
+#define regs _regs
+#include <kernel/arch/aarch64/regs.h>
+#undef regs
+struct regs {
+	struct _regs gp;
+	uint64_t elr;
+};
+static void dump_regs(struct regs *r) {
+#define reg(a,b) printf(" $x%02d=0x%016lx $x%02d=0x%016lx\n",a,r->gp.x ## a, b, r->gp.x ## b)
+	reg(0,1);
+	reg(2,3);
+	reg(4,5);
+	reg(6,7);
+	reg(8,9);
+	reg(10,11);
+	reg(12,13);
+	reg(14,15);
+	reg(16,17);
+	reg(18,19);
+	reg(20,21);
+	reg(22,23);
+	reg(24,25);
+	reg(26,27);
+	reg(28,29);
+	printf(" $x30=0x%016lx  sp=0x%016lx\n", r->gp.x30, r->gp.user_sp);
+	printf(" elr=0x%016lx\n", r->elr);
+#undef reg
+#define regs_ip(regs) ((regs)->elr)
+#define regs_bp(regs) ((regs)->gp.x29)
+}
+#else
+# error "Unsupported arch"
+#endif
 
 #define M(e) [e] = #e
 const char * signal_names[256] = {
@@ -316,7 +347,8 @@ _bail:
 
 				for (unsigned int i = 0; i < sectionHeader.sh_size / sizeof(Elf64_Sym); ++i) {
 					if (!symtab[i].st_value) continue;
-					//if ((symtab[i].st_info & 0xF) != STT_NOTYPE && (symtab[i].st_info & 0xF) != STT_FUNC) continue;
+					if ((symtab[i].st_info & 0xF) == STT_SECTION) continue;
+					if ((symtab[i].st_info & 0xF) == STT_NOTYPE) continue;
 					if (addr_in >= ((uintptr_t)symtab[i].st_value + best_base)) {
 						intptr_t x = addr_in - ((uintptr_t)symtab[i].st_value + best_base);
 						if (x < current_max) {
@@ -368,8 +400,8 @@ static void show_libs(pid_t pid) {
 static void attempt_backtrace(pid_t pid, struct regs * regs) {
 
 	/* We already printed the top, now let's try to dig down */
-	uintptr_t ip = regs->rip;
-	uintptr_t bp = regs->rbp;
+	uintptr_t ip = regs_ip(regs);
+	uintptr_t bp = regs_bp(regs);
 	int depth = 0;
 	int max_depth = 20;
 
@@ -391,19 +423,45 @@ static void attempt_backtrace(pid_t pid, struct regs * regs) {
 	}
 }
 
+static int imatch(const char * a, const char * b) {
+	do {
+		if (!*a && !*b) return 1;
+		if (tolower(*a) != tolower(*b)) return 0;
+		a++;
+		b++;
+	} while (1);
+}
+
+static int signal_from_string(const char * str) {
+	if (isdigit(*str)) {
+		return strtoul(str,NULL,0);
+	} else if (str[0] == 'S' && str[1] == 'I' && str[2] == 'G') {
+		for (int i = 0; i < 256; ++i) {
+			if (signal_names[i] && imatch(signal_names[i], str)) return i;
+		}
+		return -1;
+	} else {
+		for (int i = 0; i < 256; ++i) {
+			if (signal_names[i] && imatch(signal_names[i]+3, str)) return i;
+		}
+		return -1;
+	}
+
+	return -1;
+}
 
 static void show_commandline(pid_t pid, int status, struct regs * regs) {
 
-	fprintf(stderr, "[Process %d, $rip=%#zx]\n",
-		pid, regs->rip);
+	fprintf(stderr, "[Process %d, ip=%#zx]\n",
+		pid, regs_ip(regs));
 
 	/* Try to figure out what symbol that is */
 	char * name = NULL;
 	char * objname = NULL;
 	uintptr_t addr = 0;
-	if (find_symbol(pid, regs->rip, &name, &addr, &objname)) {
+	if (find_symbol(pid, regs_ip(regs), &name, &addr, &objname)) {
 		fprintf(stderr, "     %s+%zx in %s\n",
-			name, regs->rip - addr, objname);
+			name, regs_ip(regs) - addr, objname);
 		free(name);
 		free(objname);
 	}
@@ -459,6 +517,18 @@ static void show_commandline(pid_t pid, int status, struct regs * regs) {
 		} else if (!strcmp(buf, "continue") || !strcmp(buf,"c")) {
 			int signum = WSTOPSIG(status);
 			if (signum == SIGINT) signum = 0;
+			ptrace(PTRACE_CONT, pid, NULL, (void*)(uintptr_t)signum);
+			return;
+		} else if (!strcmp(buf, "signal")) {
+			if (!arg) {
+				fprintf(stderr, "'signal' needs an argument\n");
+				continue;
+			}
+			int signum = signal_from_string(arg);
+			if (signum == -1) {
+				fprintf(stderr, "'%s' is not a recognized signal\n", arg);
+				continue;
+			}
 			ptrace(PTRACE_CONT, pid, NULL, (void*)(uintptr_t)signum);
 			return;
 		} else if (!strcmp(buf, "step") || !strcmp(buf,"s")) {
@@ -535,6 +605,16 @@ static void show_commandline(pid_t pid, int status, struct regs * regs) {
 				}
 			}
 			printf("\n");
+		} else if (!strcmp(buf, "help")) {
+			printf("commands:\n"
+				"  show (regs, libs)\n"
+				"  backtrace\n"
+				"  continue\n"
+				"  signal signum\n"
+				"  step\n"
+				"  poke addr byte\n"
+				"  print fmt addr\n");
+			continue;
 		} else {
 			fprintf(stderr, "dbg: unrecognized command '%s'\n", buf);
 			continue;
@@ -544,7 +624,7 @@ static void show_commandline(pid_t pid, int status, struct regs * regs) {
 _exitDebugger:
 	if (binary_is_child) {
 		fprintf(stderr, "Terminating child process '%d'.\n", pid);
-		ptrace(PTRACE_CONT, pid, NULL, (void*)(uintptr_t)SIGKILL);
+		ptrace(PTRACE_DETACH, pid, NULL, (void*)(uintptr_t)SIGKILL);
 	}
 	exit(0);
 }

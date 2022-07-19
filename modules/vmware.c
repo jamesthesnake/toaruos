@@ -1,10 +1,9 @@
 /**
  * @file  kernel/arch/x86_64/vmware.c
  * @brief VMware/QEMU mouse and VMWare backdoor driver.
+ * @package x86_64
  *
  * Supports absolute mouse cursor and resolution setting.
- *
- * FIXME The vmware display size adjustment is currently disabled.
  *
  * Mouse:
  *   Toggle off / on with ioctl 1 and 2 respectively to /dev/vmmouse.
@@ -35,6 +34,7 @@
 #include <kernel/time.h>
 #include <kernel/args.h>
 #include <kernel/module.h>
+
 #include <kernel/arch/x86_64/ports.h>
 
 #define VMWARE_MAGIC  0x564D5868 /* hXMV */

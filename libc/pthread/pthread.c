@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <errno.h>
 #include <string.h>
+#include <stdio.h>
 
 #include <sys/wait.h>
 #include <sys/sysfunc.h>
@@ -37,26 +38,45 @@ struct pthread {
 };
 
 void * __tls_get_addr(void* input) {
+#ifdef __x86_64__
+	struct tls_index {
+		uintptr_t module;
+		uintptr_t offset;
+	};
+	struct tls_index * index = input;
+	/* We only support initial-exec stuff, so this must be %fs:offset */
+	uintptr_t threadbase;
+	asm ("mov %%fs:0, %0" :"=r"(threadbase));
+	return (void*)(threadbase + index->offset);
+#else
 	return NULL;
+#endif
 }
 
 void __make_tls(void) {
 	char * tlsSpace = valloc(4096);
 	memset(tlsSpace, 0x0, 4096);
-	char ** tlsSelf  = (char **)(tlsSpace + 4096 - sizeof(char *));
+	/* self-pointer start? */
+	char ** tlsSelf = (char **)(tlsSpace);
 	*tlsSelf = (char*)tlsSelf;
 	sysfunc(TOARU_SYS_FUNC_SETGSBASE, (char*[]){(char*)tlsSelf});
+}
+
+void pthread_exit(void * value) {
+	syscall_exit(0);
+	__builtin_unreachable();
 }
 
 void * __thread_start(void * thread) {
 	__make_tls();
 	struct pthread * me = ((pthread_t *)thread)->ret_val;
 	((pthread_t *)thread)->ret_val = 0;
-	return me->entry(me->arg);
+	pthread_exit(me->entry(me->arg));
+	return NULL;
 }
 
 int pthread_create(pthread_t * thread, pthread_attr_t * attr, void *(*start_routine)(void *), void * arg) {
-	char * stack = malloc(PTHREAD_STACK_SIZE);
+	char * stack = valloc(PTHREAD_STACK_SIZE);
 	uintptr_t stack_top = (uintptr_t)stack + PTHREAD_STACK_SIZE;
 
 	thread->stack = stack;
@@ -70,18 +90,6 @@ int pthread_create(pthread_t * thread, pthread_attr_t * attr, void *(*start_rout
 
 int pthread_kill(pthread_t thread, int sig) {
 	__sets_errno(kill(thread.id, sig));
-}
-
-void pthread_exit(void * value) {
-	/* Perform nice cleanup */
-#if 0
-	/* XXX: LOCK */
-	free(stack);
-	/* XXX: Return value!? */
-#endif
-	uintptr_t magic_exit_target = 0xFFFFB00F;
-	void (*magic_exit_func)(void) = (void *)magic_exit_target;
-	magic_exit_func();
 }
 
 void pthread_cleanup_push(void (*routine)(void *), void *arg) {

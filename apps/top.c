@@ -4,7 +4,7 @@
  * @copyright
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2021 K. Lange
+ * Copyright (C) 2021-2022 K. Lange
  */
 #include <fcntl.h>
 #include <stdint.h>
@@ -100,7 +100,11 @@ static int print_column(struct process * proc, int column_id) {
 		}
 		case FORMATTER_PERCENT: {
 			int value = *(int*)((char *)proc + column->member);
-			return printf("%*d.%01d ", column->width - 2, value / 10, value % 10);
+			if (value >= 1000) {
+				return printf("%*d ", column->width, value / 10);
+			} else {
+				return printf("%*d.%01d ", column->width - 2, value / 10, value % 10);
+			}
 		}
 		case FORMATTER_STRING: {
 			char * value = *(char**)((char *)proc + column->member);
@@ -123,7 +127,11 @@ static int size_column(struct process * proc, int column_id) {
 		}
 		case FORMATTER_PERCENT: {
 			int value = *(int*)((char *)proc + column->member);
-			return snprintf(garbage, 100, "%d.%01d", value / 10, value % 10);
+			if (value >= 1000) {
+				return 3;
+			} else {
+				return snprintf(garbage, 100, "%d.%01d", value / 10, value % 10);
+			}
 		}
 		case FORMATTER_STRING: {
 			char * value = *(char**)((char *)proc + column->member);
@@ -143,7 +151,12 @@ void print_header(void) {
 		printf("%*s ", ColumnDescriptions[*c].width, ColumnDescriptions[*c].title);
 		if (*c == sort_column) printf("\033[30m");
 	}
-	printf("CMD\033[K\033[0m\n");
+	if (sort_column == COLUMN_NONE) {
+		printf("\033[1;97mCMD\033[30m");
+	} else {
+		printf("CMD");
+	}
+	printf("\033[K\033[0m\n");
 }
 
 /**
@@ -337,6 +350,10 @@ static int sort_processes(const void * a, const void * b) {
 
 	struct columns * column = &ColumnDescriptions[sort_column];
 
+	if (sort_column == COLUMN_NONE) {
+		return strcmp(left->command_line, right->command_line);
+	}
+
 	switch (column->formatter) {
 		case FORMATTER_DECIMAL:
 		case FORMATTER_PERCENT: {
@@ -484,13 +501,23 @@ static void print_meter(const char * title, const char * label, int width, int c
  * @brief Switch sorting to the next column.
  */
 static void next_sort_order(void) {
-	for (int *c = columns; *c; ++c) {
-		if (*c == sort_column) {
-			if (*(c+1) == COLUMN_NONE) {
-				sort_column = *columns;
-			} else {
-				sort_column = *(c+1);
-			}
+	size_t column_count = sizeof(columns)/sizeof(*columns);
+	for (size_t i = 0; i < column_count; ++i) {
+		if (columns[i] == sort_column) {
+			sort_column = columns[(i + 1) % column_count];
+			return;
+		}
+	}
+}
+
+/**
+ * @brief Switch sorting to the previous column.
+ */
+static void prev_sort_order(void) {
+	size_t column_count = sizeof(columns)/sizeof(*columns);
+	for (size_t i = 0; i < column_count; ++i) {
+		if (columns[i] == sort_column) {
+			sort_column = columns[(i + column_count - 1) % column_count];
 			return;
 		}
 	}
@@ -667,6 +694,7 @@ static int do_once(void) {
 		int c = fgetc(stdin);
 		if (c == 'q') return 0;
 		if (c == 'w') next_sort_order();
+		if (c == 'W') prev_sort_order();
 		if (c == 'h') show_help = !show_help;
 	}
 

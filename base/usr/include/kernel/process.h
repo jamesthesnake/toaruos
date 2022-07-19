@@ -6,10 +6,18 @@
 #include <kernel/tree.h>
 #include <kernel/list.h>
 #include <kernel/spinlock.h>
-#include <kernel/arch/x86_64/pml.h>
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/signal_defs.h>
+
+#ifdef __x86_64__
+#include <kernel/arch/x86_64/pml.h>
+#endif
+
+#ifdef __aarch64__
+#include <kernel/arch/aarch64/pml.h>
+#endif
+
 
 #define PROC_REUSE_FDS 0x0001
 #define KERNEL_STACK_SIZE 0x9000
@@ -26,7 +34,11 @@ typedef struct {
 	uintptr_t bp;        /* 8 */
 	uintptr_t ip;        /* 16 */
 	uintptr_t tls_base;  /* 24 */
+#ifdef __x86_64__
 	uintptr_t saved[5]; /* XXX Arch dependent */
+#elif defined(__aarch64__)
+	uintptr_t saved[32];
+#endif
 	/**
 	 * 32: rbx
 	 * 40: r12
@@ -103,7 +115,6 @@ typedef struct process {
 	list_t * shm_mappings;
 	list_t * node_waits;
 	list_t * signal_queue;
-	char * signal_kstack;
 
 	node_t sched_node;
 	node_t sleep_node;
@@ -138,6 +149,9 @@ typedef struct process {
 	pid_t tracer;
 	spin_lock_t wait_lock;
 	list_t * tracees;
+
+	/* Syscall restarting */
+	long interrupted_system_call;
 } process_t;
 
 typedef struct {
@@ -190,6 +204,11 @@ struct ProcessorLocal {
 	char cpu_model_name[48];
 	const char * cpu_manufacturer;
 #endif
+
+#ifdef __aarch64__
+	uintptr_t sp_el1;
+	uint64_t  midr;
+#endif
 };
 
 extern struct ProcessorLocal processor_local_data[];
@@ -199,8 +218,13 @@ extern int processor_count;
  * @brief Core-local kernel data.
  *
  * x86-64: Marking this as __seg_gs makes it %gs-base-relative.
+ * aarch64: We shove this in x18 and ref off of that; -ffixed-x18 and don't forget to reload it from TPIDR_EL1
  */
+#ifdef __x86_64__
 static struct ProcessorLocal __seg_gs * const this_core = 0;
+#else
+register struct ProcessorLocal * this_core asm("x18");
+#endif
 
 extern unsigned long process_append_fd(process_t * proc, fs_node_t * node);
 extern long process_move_fd(process_t * proc, long src, long dest);
@@ -247,6 +271,7 @@ extern void arch_save_floating(process_t * proc);
 extern void arch_set_kernel_stack(uintptr_t);
 extern void arch_enter_user(uintptr_t entrypoint, int argc, char * argv[], char * envp[], uintptr_t stack);
 __attribute__((noreturn))
-extern void arch_enter_signal_handler(uintptr_t,int);
+extern void arch_enter_signal_handler(uintptr_t,int,struct regs*);
 extern void arch_wakeup_others(void);
+extern void arch_return_from_signal_handler(struct regs *r);
 

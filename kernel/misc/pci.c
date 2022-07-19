@@ -10,28 +10,60 @@
  * but it has been removed for the moment.
  *
  * TODO: Implement MSI configuration?
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2011-2021 K. Lange
  */
 #include <stdint.h>
 #include <kernel/string.h>
 #include <kernel/pci.h>
 #include <kernel/printf.h>
 
-/* TODO: PCI is sufficiently generic this shouldn't depend
- *       directly on x86-64 hardware... */
+#include <kernel/mmu.h>
+
+#ifdef __x86_64__
 #include <kernel/arch/x86_64/ports.h>
+#endif
+
+static uintptr_t pcie_addr(uint32_t device, int field) {
+	return (pci_extract_bus(device) << 20) | (pci_extract_slot(device) << 15) | (pci_extract_func(device) << 12) | (field);
+}
+
+uintptr_t pcie_ecam_phys = 0x3f000000;
 
 /**
  * @brief Write to a PCI device configuration space field.
  */
 void pci_write_field(uint32_t device, int field, int size, uint32_t value) {
+#ifdef __x86_64__
 	outportl(PCI_ADDRESS_PORT, pci_get_addr(device, field));
 	outportl(PCI_VALUE_PORT, value);
+#else
+
+	/* ECAM space */
+	if (size == 4) {
+		*(volatile uint32_t*)mmu_map_from_physical(pcie_ecam_phys + pcie_addr(device,field)) = value;
+		return;
+	} else if (size == 2) {
+		*(volatile uint16_t*)mmu_map_from_physical(pcie_ecam_phys + pcie_addr(device,field)) = value;
+		return;
+	} else if (size == 1) {
+		*(volatile uint8_t*)mmu_map_from_physical(pcie_ecam_phys + pcie_addr(device,field)) = value;
+		return;
+	}
+
+	dprintf("rejected invalid field write\n");
+
+#endif
 }
 
 /**
  * @brief Read from a PCI device configuration space field.
  */
 uint32_t pci_read_field(uint32_t device, int field, int size) {
+#ifdef __x86_64__
 	outportl(PCI_ADDRESS_PORT, pci_get_addr(device, field));
 
 	if (size == 4) {
@@ -44,6 +76,16 @@ uint32_t pci_read_field(uint32_t device, int field, int size) {
 		uint8_t t = inportb(PCI_VALUE_PORT + (field & 3));
 		return t;
 	}
+#else
+	uintptr_t field_addr = pcie_addr(device,field);
+	if (size == 4) {
+		return *(volatile uint32_t*)mmu_map_from_physical(pcie_ecam_phys + field_addr);
+	} else if (size == 2) {
+		return *(volatile uint16_t*)mmu_map_from_physical(pcie_ecam_phys + field_addr);
+	} else if (size == 1) {
+		return *(volatile uint8_t*)mmu_map_from_physical(pcie_ecam_phys + field_addr);
+	}
+#endif
 	return 0xFFFF;
 }
 

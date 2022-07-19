@@ -1,3 +1,15 @@
+/**
+ * @brief Some platform-specific abstractions.
+ *
+ * Things like initial entry point, utility functions we need
+ * in BIOS but don't already have, BIOS trampoline management,
+ * and so on.
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2018-2021 K. Lange
+ */
 extern int kmain();
 
 #ifdef EFI_PLATFORM
@@ -77,6 +89,14 @@ int bios_text_mode(void) {
 	text_reset();
 }
 
+int last_video_mode = -1;
+void bios_set_video(int mode) {
+	last_video_mode = mode;
+	do_bios_call(2, mode);
+	do_bios_call(3, mode | 0x4000);
+	init_graphics();
+}
+
 int bios_video_mode(void) {
 	int best_match = 0;
 	int match_score = 0;
@@ -96,34 +116,32 @@ int bios_video_mode(void) {
 			if (match_score < 9) { best_match = *x; match_score = 9; }
 			MATCH(1024,768,10);
 			MATCH(1280,720,50);
+			MATCH(1280,800,60);
 			MATCH(1920,1080,75);
 			MATCH(1440,900,100);
 		} else if (vbe_info_bpp == 24) {
 			if (!match_score) { best_match = *x; match_score = 1; }
 			MATCH(1024,768,3);
 			MATCH(1280,720,4);
-			MATCH(1920,1080,5);
-			MATCH(1440,900,6);
+			MATCH(1280,800,5);
+			MATCH(1920,1080,6);
+			MATCH(1440,900,7);
 		}
-
-		//print_int_(vbe_info_width); print_("x"); print_int_(vbe_info_height); print_("x"); print_int_(vbe_info_bpp); print_("bpp\n");
 	}
 
 	if (best_match) {
-		do_bios_call(2, best_match);
-		do_bios_call(3, best_match | 0x4000);
+		bios_set_video(best_match);
 	} else {
 		vbe_info_width = 0;
 	}
 
-	init_graphics();
 }
 
 void bios_toggle_mode(void) {
 	if (in_graphics_mode) {
 		bios_text_mode();
-	} else {
-		bios_video_mode();
+	} else if (last_video_mode != -1) {
+		bios_set_video(last_video_mode);
 	}
 }
 

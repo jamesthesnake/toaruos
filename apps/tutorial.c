@@ -1,10 +1,11 @@
-/* vim: tabstop=4 shiftwidth=4 noexpandtab
+/**
+ * @brief A recreation of the original wizard.py, explaining
+ *        the functionality of ToaruOS and how to use the WM.
+ *
+ * @copyright
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2019 K. Lange
- *
- * tutorial - A recreation of the original wizard.py, explaining
- *            the functionality of ToaruOS and how to use the WM.
+ * Copyright (C) 2019-2021 K. Lange
  */
 #include <time.h>
 
@@ -222,11 +223,7 @@ static void load_page(int page) {
 			circle(70, 250, 60);
 			body_text[i++] = "Many third-party software packages have been ported to ToaruOS";
 			body_text[i++] = "and are available from our package repositories. You can use the";
-			body_text[i++] = "Package Manager to install GCC, Python, Bochs, Quake, and more.";
-			body_text[i++] = "";
-			body_text[i++] = "(Beta users: Not all packages may be available yet. I'm still working";
-			body_text[i++] = "on rebuilding the Python port with a newer release, and haven't gotten";
-			body_text[i++] = "around to rebuilding the Bochs package yet.)";
+			body_text[i++] = "Package Manager to install GCC, Doom, Quake, and more.";
 			body_text[i++] = NULL;
 			break;
 		case 6:

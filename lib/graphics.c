@@ -1,11 +1,11 @@
-/* vim: tabstop=4 shiftwidth=4 noexpandtab
+/**
+ * @brief Generic Graphics library for ToaruOS
+ *
+ * @copyright
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2012-2018 K. Lange
- *
- * Generic Graphics library for ToaruOS
+ * Copyright (C) 2012-2021 K. Lange
  */
-
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
@@ -15,7 +15,7 @@
 
 #include <sys/ioctl.h>
 
-#ifndef NO_SSE
+#if !defined(NO_SSE) && defined(__x86_64__)
 #include <xmmintrin.h>
 #include <emmintrin.h>
 #endif
@@ -578,7 +578,7 @@ _cleanup_sprite:
 	return 0;
 }
 
-#ifndef NO_SSE
+#if !defined(NO_SSE) && defined(__x86_64__)
 static __m128i mask00ff;
 static __m128i mask0080;
 static __m128i mask0101;
@@ -588,9 +588,9 @@ __attribute__((constructor)) static void _masks(void) {
 	mask0080 = _mm_set1_epi16(0x0080);
 	mask0101 = _mm_set1_epi16(0x0101);
 }
-#endif
 
 __attribute__((__force_align_arg_pointer__))
+#endif
 void draw_sprite(gfx_context_t * ctx, const sprite_t * sprite, int32_t x, int32_t y) {
 
 	int32_t _left   = max(x, 0);
@@ -603,7 +603,7 @@ void draw_sprite(gfx_context_t * ctx, const sprite_t * sprite, int32_t x, int32_
 			if (y + _y < _top) continue;
 			if (y + _y > _bottom) break;
 			if (!_is_in_clip(ctx, y + _y)) continue;
-#ifdef NO_SSE
+#if defined(NO_SSE) || !defined(__x86_64__)
 			for (uint16_t _x = 0; _x < sprite->width; ++_x) {
 				if (x + _x < _left || x + _x > _right || y + _y < _top || y + _y > _bottom)
 					continue;
@@ -770,7 +770,7 @@ static uint32_t gfx_bilinear_interpolation(const sprite_t * tex, double u, doubl
 
 static inline void apply_alpha_vector(uint32_t * pixels, size_t width, uint8_t alpha) {
 	size_t i = 0;
-#ifndef NO_SSE
+#if !defined(NO_SSE) && defined(__x86_64__)
 	__m128i alp = _mm_set_epi16(alpha,alpha,alpha,alpha,alpha,alpha,alpha,alpha);
 	while (i + 3 < width) {
 		__m128i p = _mm_load_si128((void*)&pixels[i]);
@@ -984,7 +984,7 @@ void draw_sprite_rotate(gfx_context_t * ctx, const sprite_t * sprite, int32_t x,
 	gfx_matrix_identity(m);
 	gfx_matrix_translate(m, x + sprite->width / 2, y + sprite->height / 2);
 	gfx_matrix_rotate(m, rotation);
-	gfx_matrix_translate(m, sprite->width / 2, sprite->height / 2);
+	gfx_matrix_translate(m, -sprite->width / 2, -sprite->height / 2);
 	draw_sprite_transform(ctx,sprite,m,alpha);
 }
 

@@ -1,10 +1,10 @@
-/* vim: tabstop=4 shiftwidth=4 noexpandtab
+/**
+ * @brief Internal definitions used by the Yutani compositor.
+ *
+ * @copyright
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2013-2018 K. Lange
- *
- * Internal definitions used by the Yutani compositor
- * and extension plugins.
+ * Copyright (C) 2013-2021 K. Lange
  */
 #pragma once
 
@@ -203,6 +203,7 @@ typedef struct YutaniGlobals {
 	 */
 	yutani_server_window_t * bottom_z;
 	list_t * mid_zs;
+	list_t * menu_zs;
 	list_t * overlay_zs;
 	yutani_server_window_t * top_z;
 
@@ -307,6 +308,10 @@ typedef struct YutaniGlobals {
 
 	int reload_renderer;
 	uint8_t active_modifiers;
+
+	uint64_t resize_release_time;
+	int32_t resizing_init_w;
+	int32_t resizing_init_h;
 } yutani_globals_t;
 
 struct key_bind {

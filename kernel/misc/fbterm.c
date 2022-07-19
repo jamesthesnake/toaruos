@@ -1,11 +1,15 @@
 /**
  * @file  kernel/misc/fbterm.c
  * @brief Crude framebuffer terminal for 32bpp framebuffer devices.
- * @author K. Lange
  *
  * Provides a simple graphical text renderer for early startup, with
  * support for simple escape sequences, on top of a framebuffer set up
  * with the `lfbvideo` module.
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2021 K. Lange
  */
 #include <kernel/printf.h>
 #include <kernel/string.h>
@@ -50,6 +54,10 @@ extern uint32_t lfb_resolution_s;
 static inline void set_point(int x, int y, uint32_t value) {
 	if (lfb_resolution_b == 32) {
 		((uint32_t*)lfb_vid_memory)[y * (lfb_resolution_s/4) + x] = value;
+		#ifdef __aarch64__
+		/* TODO just map it uncached in the first place... */
+		asm volatile ("dc cvac, %0\n" :: "r"((uintptr_t)&((uint32_t*)lfb_vid_memory)[y * (lfb_resolution_s/4) + x]) : "memory");
+		#endif
 	} else if (lfb_resolution_b == 24) {
 		lfb_vid_memory[y * lfb_resolution_s + x * 3 + 0] = (value >> 0) & 0xFF;
 		lfb_vid_memory[y * lfb_resolution_s + x * 3 + 1] = (value >> 8) & 0xFF;
@@ -291,6 +299,7 @@ size_t fbterm_write(size_t size, uint8_t *buffer) {
 	for (unsigned int i = 0; i < size; ++i) {
 		process_char(buffer[i]);
 	}
+
 	if (previous_writer) previous_writer(size,buffer);
 	return size;
 }

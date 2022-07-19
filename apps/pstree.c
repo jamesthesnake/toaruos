@@ -1,10 +1,10 @@
-/* vim: tabstop=4 shiftwidth=4 noexpandtab
+/**
+ * @brief pstree - Display a tree of running process
+ *
+ * @copyright
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
  * Copyright (C) 2014-2018 K. Lange
- *
- * pstree - Display a tree of running process
- *
  */
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -176,10 +176,4 @@ int main (int argc, char * argv[]) {
 
 	return 0;
 }
-
-/*
- * vim: tabstop=4
- * vim: shiftwidth=4
- * vim: noexpandtab
- */
 

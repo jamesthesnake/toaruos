@@ -7,6 +7,11 @@
  * port writes and provides a runtime modesetting API for them. For other
  * devices, provides framebuffer mapping and resolution querying for modes
  * that have been preconfigured by the bootloader.
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2012-2021 K. Lange
  */
 #include <errno.h>
 #include <kernel/types.h>
@@ -98,7 +103,7 @@ static int ioctl_vid(fs_node_t * node, unsigned long request, void * argp) {
 				uintptr_t lfb_user_offset;
 				if (*(uintptr_t*)argp == 0) {
 					/* Pick an address and map it */
-					lfb_user_offset = 0x100000000; /* at 4GiB seems good */
+					lfb_user_offset = USER_DEVICE_MAP;
 				} else {
 					validate((void*)(*(uintptr_t*)argp));
 					lfb_user_offset = *(uintptr_t*)argp;
@@ -147,11 +152,9 @@ static fs_node_t * lfb_video_device_create(void /* TODO */) {
 	return fnode;
 }
 
-static ssize_t framebuffer_func(fs_node_t * node, off_t offset, size_t size, uint8_t * buffer) {
-	char * buf = malloc(4096);
-
+static void framebuffer_func(fs_node_t * node) {
 	if (lfb_driver_name) {
-		snprintf(buf, 4095,
+		procfs_printf(node,
 			"Driver:\t%s\n"
 			"XRes:\t%d\n"
 			"YRes:\t%d\n"
@@ -165,19 +168,8 @@ static ssize_t framebuffer_func(fs_node_t * node, off_t offset, size_t size, uin
 			lfb_resolution_s,
 			lfb_vid_memory);
 	} else {
-		snprintf(buf, 20, "Driver:\tnone\n");
+		procfs_printf(node, "Driver:\tnone\n");
 	}
-
-	size_t _bsize = strlen(buf);
-	if ((size_t)offset > _bsize) {
-		free(buf);
-		return 0;
-	}
-	if (size > _bsize - (size_t)offset) size = _bsize - offset;
-
-	memcpy(buffer, buf + offset, size);
-	free(buf);
-	return size;
 }
 
 static struct procfs_entry framebuffer_entry = {
@@ -201,8 +193,17 @@ static void qemu_scan_pci(uint32_t device, uint16_t v, uint16_t d, void * extra)
 	uintptr_t * output = extra;
 	if ((v == 0x1234 && d == 0x1111) ||
 	    (v == 0x10de && d == 0x0a20))  {
+		#ifndef __x86_64__
+		/* we have to configure this thing ourselves */
+		uintptr_t t = 0x10000008;
+		uintptr_t m = 0x11000000;
+		pci_write_field(device, PCI_BAR0, 4, t); /* video memory? */
+		pci_write_field(device, PCI_BAR2, 4, m); /* MMIO? */
+		pci_write_field(device, PCI_COMMAND, 2, 4|2|1);
+		#else
 		uintptr_t t = pci_read_field(device, PCI_BAR0, 4);
 		uintptr_t m = pci_read_field(device, PCI_BAR2, 4);
+		#endif
 
 		if (m == 0) {
 			/* Shoot. */
@@ -243,7 +244,7 @@ static void qemu_set_resolution(uint16_t x, uint16_t y) {
 	qemu_mmio_out(QEMU_MMIO_FBWIDTH,  x);
 	qemu_mmio_out(QEMU_MMIO_FBHEIGHT, y);
 	qemu_mmio_out(QEMU_MMIO_BPP, PREFERRED_B);
-	qemu_mmio_out(QEMU_MMIO_VIRTX, x * (PREFERRED_B  / 8));
+	qemu_mmio_out(QEMU_MMIO_VIRTX, x);
 	qemu_mmio_out(QEMU_MMIO_VIRTY, y);
 	qemu_mmio_out(QEMU_MMIO_ENABLED,  0x41); /* 01h: enabled, 40h: lfb */
 
@@ -253,7 +254,7 @@ static void qemu_set_resolution(uint16_t x, uint16_t y) {
 	lfb_resolution_x = qemu_mmio_in(QEMU_MMIO_FBWIDTH);
 	lfb_resolution_y = qemu_mmio_in(QEMU_MMIO_FBHEIGHT);
 	lfb_resolution_b = qemu_mmio_in(QEMU_MMIO_BPP);
-	lfb_resolution_s = lfb_resolution_x * 4;
+	lfb_resolution_s = qemu_mmio_in(QEMU_MMIO_VIRTX) * (lfb_resolution_b / 8);
 }
 
 static void graphics_install_bochs(uint16_t resolution_x, uint16_t resolution_y);
@@ -350,9 +351,6 @@ static void graphics_install_bochs(uint16_t resolution_x, uint16_t resolution_y)
 extern void arch_framebuffer_initialize();
 
 static void graphics_install_preset(uint16_t w, uint16_t h) {
-	/* Extract framebuffer information from multiboot */
-	arch_framebuffer_initialize();
-
 	/* Make sure memsize is actually big enough */
 	size_t minsize = lfb_resolution_s * lfb_resolution_y * 4;
 	if (lfb_memsize < minsize) lfb_memsize = minsize;
@@ -479,14 +477,14 @@ static int ioctl_vga(fs_node_t * node, unsigned long request, void * argp) {
 			{
 				uintptr_t vga_user_offset;
 				if (*(uintptr_t*)argp == 0) {
-					vga_user_offset = 0x100000000;
+					vga_user_offset = USER_DEVICE_MAP;
 				} else {
 					validate((void*)(*(uintptr_t*)argp));
 					vga_user_offset = *(uintptr_t*)argp;
 				}
 				for (uintptr_t i = 0; i < 0x1000; i += 0x1000) {
 					union PML * page = mmu_get_page(vga_user_offset + i, MMU_GET_MAKE);
-					mmu_frame_map_address(page,MMU_FLAG_WRITABLE|MMU_FLAG_WC,((uintptr_t)(0xB8000) & 0xFFFFFFFF) + i);
+					mmu_frame_map_address(page,MMU_FLAG_WRITABLE/*|MMU_FLAG_WC*/,(uintptr_t)(0xB8000 + i));
 				}
 				*((uintptr_t *)argp) = vga_user_offset;
 			}
@@ -511,13 +509,27 @@ static int lfb_init(const char * c) {
 	char * argv[10];
 	int argc = tokenize(arg, ",", argv);
 
+	if (!strcmp(argv[0],"text")) {
+		/* VGA text mode? TODO: We should try to detect this,
+		 * or limit it to things that are likely to have it... */
+		vga_text_init();
+		free(arg);
+		return 0;
+	}
+
 	uint16_t x, y;
-	if (argc < 3) {
-		x = PREFERRED_W;
-		y = PREFERRED_H;
-	} else {
+
+	/* Extract framebuffer information from multiboot */
+	arch_framebuffer_initialize();
+	x = lfb_resolution_x;
+	y = lfb_resolution_y;
+
+	if (argc >= 3) {
 		x = atoi(argv[1]);
 		y = atoi(argv[2]);
+	} else if (!lfb_resolution_x) {
+		x = PREFERRED_W;
+		y = PREFERRED_H;
 	}
 
 	int ret_val = 0;
@@ -540,10 +552,6 @@ static int lfb_init(const char * c) {
 	} else if (!strcmp(argv[0],"preset")) {
 		/* Set by bootloader (UEFI) */
 		graphics_install_preset(x,y);
-	} else if (!strcmp(argv[0],"text")) {
-		/* VGA text mode? TODO: We should try to detect this,
-		 * or limit it to things that are likely to have it... */
-		vga_text_init();
 	} else {
 		ret_val = 1;
 	}

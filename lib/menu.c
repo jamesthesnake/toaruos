@@ -1,12 +1,13 @@
-/* vim: tabstop=4 shiftwidth=4 noexpandtab
- * This file is part of ToaruOS and is released under the terms
- * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2018 K. Lange
- *
- * menu - Provides menus.
+/**
+ * @brief Cascading graphical menu library.
  *
  * C reimplementation of the original Python menu library.
  * Used to provide menu bars and the applications menu.
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2018-2021 K. Lange
  */
 #include <stdio.h>
 #include <unistd.h>
@@ -406,6 +407,7 @@ struct MenuList * menu_create(void) {
 	p->parent = NULL;
 	p->closed = 1;
 	p->flags = 0;
+	p->tail_offset = 0;
 	return p;
 }
 
@@ -534,7 +536,11 @@ static void _menu_redraw(yutani_window_t * menu_window, yutani_t * yctx, struct 
 
 		/* Figure out where to draw the tail */
 		int tail_left = 0;
-		if (menu->flags & MENU_FLAG_BUBBLE_LEFT) {
+		/* Do we have a set tail? */
+		#define TAIL_BOUND 8
+		if (menu->flags & MENU_FLAG_TAIL_POSITION) {
+			tail_left = (menu->tail_offset < TAIL_BOUND) ? TAIL_BOUND : (menu->tail_offset > ctx->width - TAIL_BOUND) ? (ctx->width - TAIL_BOUND) : menu->tail_offset;
+		} else if (menu->flags & MENU_FLAG_BUBBLE_LEFT) {
 			tail_left = 16;
 		} else if (menu->flags & MENU_FLAG_BUBBLE_RIGHT) {
 			tail_left = ctx->width - 16;
@@ -584,9 +590,11 @@ void menu_prepare(struct MenuList * menu, yutani_t * yctx) {
 	menu->closed = 0;
 
 	/* Create window */
+
 	yutani_window_t * menu_window = yutani_window_create_flags(yctx, width, height,
-		(menu->flags & MENU_FLAG_BUBBLE) ? YUTANI_WINDOW_FLAG_ALT_ANIMATION :
-			YUTANI_WINDOW_FLAG_NO_ANIMATION);
+		((menu->flags & MENU_FLAG_BUBBLE) ? YUTANI_WINDOW_FLAG_ALT_ANIMATION :
+			YUTANI_WINDOW_FLAG_NO_ANIMATION) | YUTANI_WINDOW_FLAG_DISALLOW_DRAG | YUTANI_WINDOW_FLAG_DISALLOW_RESIZE);
+	yutani_set_stack(yctx, menu_window, YUTANI_ZORDER_MENU);
 	if (menu->ctx) {
 		reinit_graphics_yutani(menu->ctx, menu_window);
 	} else {

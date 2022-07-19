@@ -1,6 +1,7 @@
 /**
  * @file  kernel/arch/x86_64/vbox.c
  * @brief VirtualBox Guest Additions driver
+ * @package x86_64
  *
  * Implements the following features:
  * - Absolute mouse cursor positioning
@@ -25,10 +26,10 @@
 #include <kernel/mouse.h>
 #include <kernel/args.h>
 #include <kernel/module.h>
+#include <kernel/mmu.h>
 
 #include <kernel/arch/x86_64/regs.h>
 #include <kernel/arch/x86_64/ports.h>
-#include <kernel/arch/x86_64/mmu.h>
 #include <kernel/arch/x86_64/irq.h>
 
 #define VBOX_VENDOR_ID 0x80EE

@@ -1,3 +1,12 @@
+/**
+ * @file kernel/sys/syscall.c
+ * @brief System call handlers.
+ *
+ * @copyright
+ * This file is part of ToaruOS and is released under the terms
+ * of the NCSA / University of Illinois License - see LICENSE.md
+ * Copyright (C) 2011-2021 K. Lange
+ */
 #include <stdint.h>
 #include <errno.h>
 #include <sys/sysfunc.h>
@@ -75,8 +84,8 @@ long sys_sysfunc(long fn, char ** args) {
 			 *        Misaka switched everything to raw printfs, and then also
 			 *        removed most of them for cleanliness... first task would
 			 *        be to reintroduce kernel fprintf() to printf to fs_nodes. */
-			if (this_core->current_process->user != 0) return -EACCES;
-			printf("loghere: not implemented\n");
+			//if (this_core->current_process->user != 0) return -EACCES;
+			printf("\033[32m%s\033[0m", (char*)args);
 			return -EINVAL;
 
 		case TOARU_SYS_FUNC_KDEBUG:
@@ -85,6 +94,23 @@ long sys_sysfunc(long fn, char ** args) {
 			if (this_core->current_process->user != 0) return -EACCES;
 			printf("kdebug: not implemented\n");
 			return -EINVAL;
+
+		case 42:
+			#ifdef __aarch64__
+			PTR_VALIDATE(&args[0]);
+			PTR_VALIDATE(&args[1]);
+			extern void arch_clear_icache(uintptr_t,uintptr_t);
+			arch_clear_icache((uintptr_t)args[0], (uintptr_t)args[1]);
+			#endif
+			return 0;
+
+		case 43: {
+			extern void mmu_unmap_user(uintptr_t addr, size_t size);
+			PTR_VALIDATE(&args[0]);
+			PTR_VALIDATE(&args[1]);
+			mmu_unmap_user((uintptr_t)args[0], (size_t)args[1]);
+			return 0;
+		}
 
 		case TOARU_SYS_FUNC_INSMOD:
 			/* Linux has init_module as a system call? */
@@ -182,6 +208,12 @@ long sys_exit(long exitcode) {
 }
 
 long sys_write(int fd, char * ptr, unsigned long len) {
+#if 0
+	/* Enable this to force stderr output to always be printed by the kernel. */
+	if (fd == 2) {
+		printf_output(len,ptr);
+	}
+#endif
 	if (FD_CHECK(fd)) {
 		PTRCHECK(ptr,len,MMU_PTR_NULL);
 		fs_node_t * node = FD_ENTRY(fd);
@@ -416,7 +448,7 @@ long sys_read(int fd, char * ptr, unsigned long len) {
 	return -EBADF;
 }
 
-long sys_ioctl(int fd, int request, void * argp) {
+long sys_ioctl(int fd, unsigned long request, void * argp) {
 	if (FD_CHECK(fd)) {
 		PTR_VALIDATE(argp);
 		return ioctl_fs(FD_ENTRY(fd), request, argp);
@@ -527,6 +559,14 @@ long sys_gettimeofday(struct timeval * tv, void * tz) {
 	PTR_VALIDATE(tz);
 	if (!tv) return -EFAULT;
 	return gettimeofday(tv, tz);
+}
+
+long sys_settimeofday(struct timeval * tv, void * tz) {
+	extern int settimeofday(struct timeval * t, void *z);
+	if (this_core->current_process->user != USER_ROOT_UID) return -EPERM;
+	PTR_VALIDATE(tv);
+	PTR_VALIDATE(tz);
+	return settimeofday(tv,tz);
 }
 
 long sys_getuid(void) {
@@ -1118,6 +1158,7 @@ static long (*syscalls[])() = {
 	[SYS_SETGROUPS]    = sys_setgroups,
 	[SYS_TIMES]        = sys_times,
 	[SYS_PTRACE]       = ptrace_handle,
+	[SYS_SETTIMEOFDAY] = sys_settimeofday,
 
 	[SYS_SOCKET]       = net_socket,
 	[SYS_SETSOCKOPT]   = net_setsockopt,
@@ -1148,9 +1189,15 @@ void syscall_handler(struct regs * r) {
 		ptrace_signal(SIGTRAP, PTRACE_EVENT_SYSCALL_ENTER);
 	}
 
-	arch_syscall_return(r, func(
+	long result = func(
 		arch_syscall_arg0(r), arch_syscall_arg1(r), arch_syscall_arg2(r),
-		arch_syscall_arg3(r), arch_syscall_arg4(r)));
+		arch_syscall_arg3(r), arch_syscall_arg4(r));
+
+	if (result == -ERESTARTSYS) {
+		this_core->current_process->interrupted_system_call = arch_syscall_number(r);
+	}
+
+	arch_syscall_return(r, result);
 
 	if (this_core->current_process->flags & PROC_FLAG_TRACE_SYSCALLS) {
 		ptrace_signal(SIGTRAP, PTRACE_EVENT_SYSCALL_EXIT);

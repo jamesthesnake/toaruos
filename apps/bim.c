@@ -15,6 +15,10 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 #include "bim.h"
+
+#define BIM_VERSION   "3.0.0" TAG
+#define BIM_COPYRIGHT "Copyright 2012-2021 K. Lange <\033[3mklange@toaruos.org\033[23m>"
+
 #include <kuroko/kuroko.h>
 #include <kuroko/vm.h>
 #include <kuroko/debug.h>
@@ -842,7 +846,7 @@ const char * flag_to_color(int _flag) {
  * Match and paint a single keyword. Returns 1 if the keyword was matched and 0 otherwise,
  * so it can be used for prefix checking for things that need further special handling.
  */
-int match_and_paint(struct syntax_state * state, const char * keyword, int flag, int (*keyword_qualifier)(int c)) {
+static int match_and_paint(struct syntax_state * state, const char * keyword, int flag, int (*keyword_qualifier)(int c)) {
 	if (keyword_qualifier(lastchar())) return 0;
 	if (!keyword_qualifier(charat())) return 0;
 	int i = state->i;
@@ -866,7 +870,7 @@ int match_and_paint(struct syntax_state * state, const char * keyword, int flag,
 /**
  * This is a basic character matcher for "keyword" characters.
  */
-int simple_keyword_qualifier(int c) {
+static int simple_keyword_qualifier(int c) {
 	return isalnum(c) || (c == '_');
 }
 
@@ -875,7 +879,7 @@ int simple_keyword_qualifier(int c) {
  * Since there are a lot of comment highlighters, this is provided
  * as a common function that can be used by multiple highlighters.
  */
-int common_comment_buzzwords(struct syntax_state * state) {
+static int common_comment_buzzwords(struct syntax_state * state) {
 	if (match_and_paint(state, "TODO", FLAG_NOTICE, simple_keyword_qualifier)) { return 1; }
 	else if (match_and_paint(state, "XXX", FLAG_NOTICE, simple_keyword_qualifier)) { return 1; }
 	else if (match_and_paint(state, "FIXME", FLAG_ERROR, simple_keyword_qualifier)) { return 1; }
@@ -887,7 +891,7 @@ int common_comment_buzzwords(struct syntax_state * state) {
  * (Some languages have comments that can continue with a \ - don't use this!)
  * Assumes you've already painted your comment start characters.
  */
-int paint_comment(struct syntax_state * state) {
+static int paint_comment(struct syntax_state * state) {
 	while (charat() != -1) {
 		if (common_comment_buzzwords(state)) continue;
 		else { paint(1, FLAG_COMMENT); }
@@ -898,7 +902,7 @@ int paint_comment(struct syntax_state * state) {
 /**
  * Find and return a highlighter by name, or return NULL if none was found.
  */
-struct syntax_definition * find_syntax_calculator(const char * name) {
+static struct syntax_definition * find_syntax_calculator(const char * name) {
 	for (struct syntax_definition * s = syntaxes; syntaxes && s->name; ++s) {
 		if (!strcmp(s->name, name)) {
 			return s;
@@ -967,10 +971,15 @@ void recalculate_syntax(line_t * line, int line_no) {
 		s->state.i = 0;
 
 		while (1) {
+			struct termios old, new;
+			tcgetattr(global_config.tty_in, &old);
+			new = old; new.c_lflag |= ISIG;
+			tcsetattr(global_config.tty_in, TCSANOW, &new);
 			ptrdiff_t before = krk_currentThread.stackTop - krk_currentThread.stack;
 			krk_push(OBJECT_VAL(env->syntax->krkFunc));
 			krk_push(OBJECT_VAL(s));
 			KrkValue result = krk_callStack(1);
+			tcsetattr(global_config.tty_in, TCSANOW, &old);
 			krk_currentThread.stackTop = krk_currentThread.stack + before;
 			if (IS_NONE(result) && (krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION)) {
 				render_error("Exception occurred in plugin: %s", AS_INSTANCE(krk_currentThread.currentException)->_class->name->chars);
@@ -3437,6 +3446,11 @@ void SIGCONT_handler(int sig) {
 	signal(SIGTSTP, SIGTSTP_handler);
 }
 
+void SIGINT_handler(int sig) {
+	krk_currentThread.flags |= KRK_THREAD_SIGNALLED;
+	signal(SIGINT,   SIGINT_handler);
+}
+
 void try_to_center() {
 	int half_a_screen = (global_config.term_height - 3) / 2;
 	if (half_a_screen < env->line_no) {
@@ -4655,10 +4669,18 @@ void perform_replacement(int line_no, uint32_t * needle, uint32_t * replacement,
 			}
 			int t = 0;
 			for (uint32_t * r = replacement; *r; ++r) {
+				uint32_t rep = *r;
+				if (*r == '\\' && r[1] == 't') {
+					rep = '\t';
+					++r;
+				} else if (*r == '\\' && (r[1] == '\\')) {
+					rep = r[1];
+					++r;
+				}
 				char_t _c;
-				_c.codepoint = *r;
+				_c.codepoint = rep;
 				_c.flags = 0;
-				_c.display_width = codepoint_width(*r);
+				_c.display_width = codepoint_width(rep);
 				line_t * nline = line_insert(line, _c, j + t, line_no -1);
 				if (line != nline) {
 					env->lines[line_no-1] = nline;
@@ -6294,7 +6316,7 @@ _try_kuroko:
 					KrkValue thisValue = findFromProperty(root, asToken);
 					krk_push(thisValue);
 					if (IS_CLOSURE(thisValue) || IS_BOUND_METHOD(thisValue) ||
-						(IS_NATIVE(thisValue) && !(((KrkNative*)AS_OBJECT(thisValue))->flags & KRK_NATIVE_FLAGS_IS_DYNAMIC_PROPERTY))) {
+						(IS_NATIVE(thisValue) && !(AS_OBJECT(thisValue)->flags & KRK_OBJ_FLAGS_FUNCTION_IS_DYNAMIC_PROPERTY))) {
 						size_t allocSize = s->length + 2;
 						char * tmp = malloc(allocSize);
 						size_t len = snprintf(tmp, allocSize, "%s(", s->chars);
@@ -10230,6 +10252,7 @@ int process_krk_command(const char * cmd, KrkValue * outVal) {
 	}
 	/* Otherwise, we can look at the result here. */
 	if (!IS_NONE(out) && !(IS_INTEGER(out) && AS_INTEGER(out) == 0)) {
+		krk_attachNamedValue(&vm.builtins->fields, "_", out);
 		krk_push(out);
 		KrkValue repr = krk_callDirect(krk_getType(out)->_reprer, 1);
 		if (IS_STRING(repr)) {
@@ -10439,7 +10462,7 @@ static int checkClass(KrkClass * _class, KrkClass * base) {
 }
 
 static KrkValue krk_bim_syntax_dict;
-static KrkValue krk_bim_register_syntax(int argc, KrkValue argv[], int hasKw) {
+static KrkValue krk_bim_register_syntax(int argc, const KrkValue argv[], int hasKw) {
 	if (argc < 1 || !IS_CLASS(argv[0]) || !checkClass(AS_CLASS(argv[0]), syntaxStateClass))
 		return krk_runtimeError(vm.exceptions->typeError, "Can not register '%s' as a syntax highlighter, expected subclass of SyntaxState.", krk_typeName(argv[0]));
 
@@ -10486,7 +10509,7 @@ static KrkValue krk_bim_register_syntax(int argc, KrkValue argv[], int hasKw) {
 }
 
 static KrkValue krk_bim_theme_dict;
-static KrkValue krk_bim_define_theme(int argc, KrkValue argv[], int hasKw) {
+static KrkValue krk_bim_define_theme(int argc, const KrkValue argv[], int hasKw) {
 	if (argc < 1 || !IS_CLOSURE(argv[0]))
 		return krk_runtimeError(vm.exceptions->typeError, "themes must be functions, not '%s'", krk_typeName(argv[0]));
 
@@ -10501,7 +10524,7 @@ static KrkValue krk_bim_define_theme(int argc, KrkValue argv[], int hasKw) {
 	return argv[0];
 }
 
-int c_keyword_qualifier(int c) {
+static int c_keyword_qualifier(int c) {
 	return isalnum(c) || (c == '_');
 }
 
@@ -10513,64 +10536,63 @@ int c_keyword_qualifier(int c) {
 
 static KrkTuple * _bim_state_chars = NULL;
 
-static KrkValue bim_krk_state_getstate(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_getstate(int argc, const KrkValue argv[], int hasKw) {
 	BIM_STATE();
-	if (argc > 1 && IS_INTEGER(argv[1])) {
-		state->state = AS_INTEGER(argv[1]);
-	} else if (argc > 1 && IS_NONE(argv[1])) {
-		state->state = -1;
-	}
 	return INTEGER_VAL(state->state);
 }
-static KrkValue bim_krk_state_setstate(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_setstate(int argc, const KrkValue argv[], int hasKw) {
 	BIM_STATE();
-	if (argc > 1 && IS_INTEGER(argv[1])) {
-		state->state = AS_INTEGER(argv[1]);
-	} else if (argc > 1 && IS_NONE(argv[1])) {
-		state->state = -1;
-	} else {
-		return krk_runtimeError(vm.exceptions->typeError, "expected int");
-	}
-	return NONE_VAL();
+	if (argc < 2 || !IS_INTEGER(argv[1])) return NONE_VAL();
+	state->state = AS_INTEGER(argv[1]);
+	return INTEGER_VAL(state->state);
 }
-static KrkValue bim_krk_state_index(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_index(int argc, const KrkValue argv[], int hasKw) {
 	BIM_STATE();
 	return INTEGER_VAL(state->i);
 }
-static KrkValue bim_krk_state_lineno(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_lineno(int argc, const KrkValue argv[], int hasKw) {
 	BIM_STATE();
 	return INTEGER_VAL(state->line_no);
 }
-static KrkValue bim_krk_state_get(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_get(int argc, const KrkValue argv[], int hasKw) {
 	BIM_STATE();
-	long arg = AS_INTEGER(argv[1]);
-	int charRel = charrel(arg);
-	if (charRel == -1) return NONE_VAL();
-	if (charRel >= 32 && charRel <= 126) return _bim_state_chars->values.values[charRel - 32];
-	char tmp[8] = {0};
-	size_t len = to_eight(charRel, tmp);
-	return OBJECT_VAL(krk_copyString(tmp,len));
-}
-static KrkValue bim_krk_state_getslice(int argc, KrkValue argv[], int hasKw) {
-	BIM_STATE();
-	struct StringBuilder sb = {0};
-	if (!(IS_INTEGER(argv[1]) || IS_NONE(argv[1]))) return krk_runtimeError(vm.exceptions->typeError, "Bad index");
-	if (!(IS_INTEGER(argv[2]) || IS_NONE(argv[2]))) return krk_runtimeError(vm.exceptions->typeError, "Bad index");
-	int start = IS_NONE(argv[1]) ? 0 : AS_INTEGER(argv[1]);
-	int end   = IS_NONE(argv[2]) ? (krk_integer_type)(state->line->actual - state->i) : AS_INTEGER(argv[2]);
-	if (end < start) end = start;
 
-	for (int i = start; i < end; ++i) {
-		int charRel = charrel(i);
-		if (charRel == -1) break;
+	/* non-slice item */
+	if (IS_INTEGER(argv[1])) {
+		long arg = AS_INTEGER(argv[1]);
+		int charRel = charrel(arg);
+		if (charRel == -1) return NONE_VAL();
+		if (charRel >= 32 && charRel <= 126) return _bim_state_chars->values.values[charRel - 32];
 		char tmp[8] = {0};
 		size_t len = to_eight(charRel, tmp);
-		pushStringBuilderStr(&sb, tmp, len);
-	}
+		return OBJECT_VAL(krk_copyString(tmp,len));
+	} else if (IS_slice(argv[1])) {
+		struct StringBuilder sb = {0};
 
-	return finishStringBuilder(&sb);
+		extern int krk_extractSlicer(const char * _method_name, KrkValue slicerVal, krk_integer_type count, krk_integer_type *start, krk_integer_type *end, krk_integer_type *step);
+		krk_integer_type start, end, step;
+		if (krk_extractSlicer("__getitem__", argv[1], state->line->actual - state->i, &start, &end, &step)) {
+			return NONE_VAL();
+		}
+
+		krk_integer_type i = start;
+
+		while ((step < 0) ? (i > end) : (i < end)) {
+			int charRel = charrel(i);
+			if (charRel == -1) break;
+			char tmp[8] = {0};
+			size_t len = to_eight(charRel, tmp);
+			pushStringBuilderStr(&sb, tmp, len);
+			i += step;
+		}
+
+		return finishStringBuilder(&sb);
+	} else {
+		return krk_runtimeError(vm.exceptions->typeError, "%s() expects %s, not '%s'",
+			"__getitem__", "int or slice", krk_typeName(argv[1]));
+	}
 }
-static KrkValue bim_krk_state_isdigit(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_isdigit(int argc, const KrkValue argv[], int hasKw) {
 	if (IS_NONE(argv[1])) return BOOLEAN_VAL(0);
 	if (!IS_STRING(argv[1])) {
 		krk_runtimeError(vm.exceptions->typeError, "not a string: %s", krk_typeName(argv[1]));
@@ -10583,13 +10605,17 @@ static KrkValue bim_krk_state_isdigit(int argc, KrkValue argv[], int hasKw) {
 	unsigned int c = krk_unicodeCodepoint(AS_STRING(argv[1]), 0);
 	return BOOLEAN_VAL(!!isdigit(c));
 }
-static KrkValue bim_krk_state_isxdigit(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_isxdigit(int argc, const KrkValue argv[], int hasKw) {
 	if (!IS_STRING(argv[1])) return BOOLEAN_VAL(0);
 	if (AS_STRING(argv[1])->length > 1) return BOOLEAN_VAL(0);
 	int c = AS_CSTRING(argv[1])[0];
 	return BOOLEAN_VAL(!!isxdigit(c));
 }
-static KrkValue bim_krk_state_paint(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_paint(int argc, const KrkValue argv[], int hasKw) {
+	/* self.paint(count, color)
+	 * or
+	 * self[count] = color
+	 */
 	BIM_STATE();
 	long howMuch = AS_INTEGER(argv[1]);
 	if (howMuch == -1) howMuch = state->line->actual;
@@ -10597,17 +10623,39 @@ static KrkValue bim_krk_state_paint(int argc, KrkValue argv[], int hasKw) {
 	paint(howMuch, whatFlag);
 	return NONE_VAL();
 }
-static KrkValue bim_krk_state_paintComment(int argc, KrkValue argv[], int hasKw) {
+#define KRK_STRING_FAST(string,offset)  (uint32_t)\
+	((string->obj.flags & KRK_OBJ_FLAGS_STRING_MASK) <= (KRK_OBJ_FLAGS_STRING_UCS1) ? ((uint8_t*)string->codes)[offset] : \
+	((string->obj.flags & KRK_OBJ_FLAGS_STRING_MASK) == (KRK_OBJ_FLAGS_STRING_UCS2) ? ((uint16_t*)string->codes)[offset] : \
+	((uint32_t*)string->codes)[offset]))
+static KrkValue bim_krk_state_check(int argc, const KrkValue argv[], int hasKw) {
+	/* 'string' in self */
+	BIM_STATE();
+	int c = charrel(0);
+
+	if (IS_NONE(argv[1])) return BOOLEAN_VAL((c == -1));
+	if (!IS_STRING(argv[1])) return krk_runtimeError(vm.exceptions->typeError, "expected string");
+
+	KrkString * s = AS_STRING(argv[1]);
+	krk_unicodeString(s);
+
+	for (size_t i = 0; i < s->codesLength; ++i) {
+		int cp = (int)KRK_STRING_FAST(s,i);
+		if (c == cp) return BOOLEAN_VAL(1);
+	}
+	return BOOLEAN_VAL(0);
+}
+
+static KrkValue bim_krk_state_paintComment(int argc, const KrkValue argv[], int hasKw) {
 	BIM_STATE();
 	paint_comment(state);
 	return NONE_VAL();
 }
-static KrkValue bim_krk_state_skip(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_skip(int argc, const KrkValue argv[], int hasKw) {
 	BIM_STATE();
 	skip();
 	return NONE_VAL();
 }
-static KrkValue bim_krk_state_cKeywordQualifier(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_cKeywordQualifier(int argc, const KrkValue argv[], int hasKw) {
 	if (IS_INTEGER(argv[0])) return BOOLEAN_VAL(!!c_keyword_qualifier(AS_INTEGER(argv[0])));
 	if (!IS_STRING(argv[0])) return BOOLEAN_VAL(0);
 	if (AS_STRING(argv[0])->length > 1) return BOOLEAN_VAL(0);
@@ -10623,12 +10671,7 @@ static int callQualifier(KrkValue qualifier, int codepoint) {
 	return 0;
 }
 
-#define KRK_STRING_FAST(string,offset)  (uint32_t)\
-	(string->type <= 1 ? ((uint8_t*)string->codes)[offset] : \
-	(string->type == 2 ? ((uint16_t*)string->codes)[offset] : \
-	((uint32_t*)string->codes)[offset]))
-
-static KrkValue bim_krk_state_findKeywords(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_findKeywords(int argc, const KrkValue argv[], int hasKw) {
 	BIM_STATE();
 	if (unlikely(argc < 4 || !(IS_INSTANCE(argv[1]) && AS_INSTANCE(argv[1])->_class == vm.baseClasses->listClass) || !IS_INTEGER(argv[2])))
 		return krk_runtimeError(vm.exceptions->typeError, "invalid arguments to SyntaxState.findKeywords");
@@ -10645,7 +10688,7 @@ static KrkValue bim_krk_state_findKeywords(int argc, KrkValue argv[], int hasKw)
 
 		KrkString * me = AS_STRING(AS_LIST(argv[1])->values[keyword]);
 		size_t d = 0;
-		if (me->type == KRK_STRING_ASCII) {
+		if ((me->obj.flags & KRK_OBJ_FLAGS_STRING_MASK) == KRK_OBJ_FLAGS_STRING_ASCII) {
 			while (state->i + (int)d < state->line->actual &&
 			       d < me->codesLength &&
 			       state->line->text[state->i+d].codepoint == me->chars[d]) d++;
@@ -10663,7 +10706,7 @@ static KrkValue bim_krk_state_findKeywords(int argc, KrkValue argv[], int hasKw)
 	}
 	return BOOLEAN_VAL(0);
 }
-static KrkValue bim_krk_state_matchAndPaint(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_matchAndPaint(int argc, const KrkValue argv[], int hasKw) {
 	BIM_STATE();
 	if (argc < 4 || !IS_STRING(argv[1]) || !IS_INTEGER(argv[2]))
 		return krk_runtimeError(vm.exceptions->typeError, "invalid arguments to SyntaxState.matchAndPaint");
@@ -10671,7 +10714,7 @@ static KrkValue bim_krk_state_matchAndPaint(int argc, KrkValue argv[], int hasKw
 	int flag = AS_INTEGER(argv[2]);
 	KrkString * me = AS_STRING(argv[1]);
 	size_t d = 0;
-	if (me->type == KRK_STRING_ASCII) {
+	if ((me->obj.flags & KRK_OBJ_FLAGS_STRING_MASK) == KRK_OBJ_FLAGS_STRING_ASCII) {
 		while (state->i + (int)d < state->line->actual &&
 		       d < me->codesLength &&
 		       state->line->text[state->i+d].codepoint == me->chars[d]) d++;
@@ -10688,16 +10731,16 @@ static KrkValue bim_krk_state_matchAndPaint(int argc, KrkValue argv[], int hasKw
 	}
 	return BOOLEAN_VAL(0);
 }
-static KrkValue bim_krk_state_rewind(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_rewind(int argc, const KrkValue argv[], int hasKw) {
 	BIM_STATE();
 	state->i -= AS_INTEGER(argv[1]);
 	return NONE_VAL();
 }
-static KrkValue bim_krk_state_commentBuzzwords(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_commentBuzzwords(int argc, const KrkValue argv[], int hasKw) {
 	BIM_STATE();
 	return BOOLEAN_VAL(common_comment_buzzwords(state));
 }
-static KrkValue bim_krk_state_init(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_state_init(int argc, const KrkValue argv[], int hasKw) {
 	BIM_STATE();
 	if (argc < 2 || !krk_isInstanceOf(argv[1], syntaxStateClass)) {
 		return krk_runtimeError(vm.exceptions->typeError, "Can only initialize subhighlighter from an existing highlighter.");
@@ -10708,7 +10751,7 @@ static KrkValue bim_krk_state_init(int argc, KrkValue argv[], int hasKw) {
 	return argv[0];
 }
 
-static KrkValue krk_bim_get_commands(int argc, KrkValue argv[], int hasKw) {
+static KrkValue krk_bim_get_commands(int argc, const KrkValue argv[], int hasKw) {
 	KrkValue myList = krk_list_of(0, NULL,0);
 	krk_push(myList);
 	for (struct command_def * c = regular_commands; regular_commands && c->name; ++c) {
@@ -10726,7 +10769,7 @@ struct ActionDef {
 	struct action_def * action;
 };
 
-static KrkValue bim_krk_action_call(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_action_call(int argc, const KrkValue argv[], int hasKw) {
 	struct ActionDef * self = (void*)AS_OBJECT(argv[0]);
 
 	/* Figure out arguments */
@@ -10758,7 +10801,7 @@ static KrkValue bim_krk_action_call(int argc, KrkValue argv[], int hasKw) {
 	return NONE_VAL();
 }
 
-static KrkValue bim_krk_command_call(int argc, KrkValue argv[], int hasKw) {
+static KrkValue bim_krk_command_call(int argc, const KrkValue argv[], int hasKw) {
 	struct CommandDef * self = (void*)AS_OBJECT(argv[0]);
 
 	char ** args = malloc(sizeof(char*)*argc);
@@ -10838,25 +10881,54 @@ void import_directory(char * dirName) {
 	}
 
 	if (dirpath) {
-		/* This is a dumb hack. */
-		char tmp[4096];
-		sprintf(tmp,
-			"import kuroko\n"
-			"if '%s%s' not in kuroko.module_paths:\n"
-			" kuroko.module_paths.insert(0,'%s%s')\n",
-			dirpath, extra, dirpath, extra);
-		krk_interpret(tmp,"<bim>");
+		/* get kuroko.module_paths */
+		krk_push(krk_valueGetAttribute(OBJECT_VAL(vm.system), "module_paths"));
+		krk_push(krk_valueGetAttribute(krk_peek(0), "insert"));
+		krk_push(INTEGER_VAL(0));
+		/* calculate dirpath + extra */
+		krk_push(OBJECT_VAL(krk_copyString(dirpath,strlen(dirpath))));
+		krk_push(OBJECT_VAL(krk_copyString(extra,strlen(extra))));
+		krk_addObjects();
+		krk_callStack(2); /* result value is popped */
+		krk_pop(); /* should just be the list */
 	}
 
 	if (dirpath) free(dirpath);
 	struct dirent * ent = readdir(dirp);
 	while (ent) {
 		if (str_ends_with(ent->d_name,".krk") && !str_ends_with(ent->d_name,"__init__.krk")) {
-			char * tmp = malloc(strlen(dirName) + 1 + strlen(ent->d_name) + 1 + 7);
-			snprintf(tmp, strlen(dirName) + 1 + strlen(ent->d_name) + 1 + 7, "import %s.%s", dirName, ent->d_name);
-			tmp[strlen(tmp)-4] = '\0';
-			krk_interpret(tmp,ent->d_name);
-			free(tmp);
+			/* put "dir.file" onto the stack */
+			krk_push(OBJECT_VAL(krk_copyString(dirName,strlen(dirName))));
+			krk_push(OBJECT_VAL(S(".")));
+			krk_addObjects();
+			krk_push(OBJECT_VAL(krk_copyString(ent->d_name,strlen(ent->d_name)-4)));
+			krk_addObjects();
+
+			/* import that */
+			krk_doRecursiveModuleLoad(AS_STRING(krk_peek(0)));
+
+			if (krk_currentThread.flags & KRK_THREAD_HAS_EXCEPTION) {
+				krk_dumpTraceback();
+				render_error("The above exception was encountered while loading '%s/%s'.", dirName, ent->d_name);
+
+				if (global_config.has_terminal) {
+					/* Prompt to continue */
+					render_commandline_message("Continue loading modules? (y/N) ");
+					int key;
+					while ((key = bim_getkey(DEFAULT_KEY_WAIT)) == KEY_TIMEOUT);
+					if (key != 'y') {
+						krk_resetStack();
+						break;
+					}
+				} else {
+					render_error("Press ENTER to continue loading.");
+					int c;
+					while ((c = bim_getch(), c != ENTER_KEY && c != LINE_FEED));
+				}
+			}
+
+			/* reset the stack */
+			krk_resetStack();
 		}
 		ent = readdir(dirp);
 	}
@@ -10920,7 +10992,7 @@ BIM_COMMAND(reload,"reload","Reloads all the Kuroko stuff.") {
 	return 0;
 }
 
-static KrkValue krk_bim_getDocumentText(int argc, KrkValue argv[], int hasKw) {
+static KrkValue krk_bim_getDocumentText(int argc, const KrkValue argv[], int hasKw) {
 	struct StringBuilder sb = {0};
 
 	int i, j;
@@ -10942,7 +11014,7 @@ static KrkValue krk_bim_getDocumentText(int argc, KrkValue argv[], int hasKw) {
 	return finishStringBuilder(&sb);
 }
 
-static KrkValue krk_bim_renderError(int argc, KrkValue argv[], int hasKw) {
+static KrkValue krk_bim_renderError(int argc, const KrkValue argv[], int hasKw) {
 	static const char * _method_name = "renderError";
 	if (argc != 1 || !IS_STRING(argv[0])) return TYPE_ERROR(str,argv[0]);
 	if (AS_STRING(argv[0])->length == 0)
@@ -10957,7 +11029,12 @@ static KrkValue krk_bim_renderError(int argc, KrkValue argv[], int hasKw) {
  */
 void initialize(void) {
 	/* Force empty locale */
+#ifdef __APPLE__
+	/* TODO figure out a better way to do this; maybe just LC_CTYPE? */
+	setlocale(LC_ALL, "en_US.UTF-8");
+#else
 	setlocale(LC_ALL, "");
+#endif
 
 	/* Set up default key mappings */
 #define CLONE_MAP(map) do { \
@@ -10990,13 +11067,19 @@ void initialize(void) {
 	global_config.tab_indicator = strdup(">");
 	global_config.space_indicator = strdup("-");
 
-#if 0
-	krk_initVM(KRK_GLOBAL_CALLGRIND); /* no debug flags */
-	vm.callgrindFile = fopen("callgrind.out","w");
-#else
-	krk_initVM(0); /* no debug flags */
-#endif
+	/* Initialize Kuroko runtime context */
+	krk_initVM(0);
 
+	/**
+	 * Build the 'bim' module:
+	 * @c bindHighlighter Applied to syntax highlighter classes to register them.
+	 * @c getCommands     Returns a list of bim command objects.
+	 * @c themes          dict, theme names to theme functions.
+	 * @c defineTheme     Applied to theme functions to register them.
+	 * @c highlighters    dict, syntax highlighter names to highlighter classes.
+	 * @c getDocumentText Return a string with the full contents of the current buffer.
+	 * @c renderError     Binding to render_error.
+	 */
 	KrkInstance * bimModule = krk_newInstance(vm.baseClasses->moduleClass);
 	krk_attachNamedObject(&vm.modules, "bim", (KrkObj*)bimModule);
 	krk_attachNamedObject(&bimModule->fields, "__name__", (KrkObj*)S("bim"));
@@ -11007,10 +11090,14 @@ void initialize(void) {
 	krk_defineNative(&bimModule->fields, "defineTheme", krk_bim_define_theme);
 	krk_bim_syntax_dict = krk_dict_of(0,NULL,0);
 	krk_attachNamedValue(&bimModule->fields, "highlighters", krk_bim_syntax_dict);
-
 	krk_defineNative(&bimModule->fields, "getDocumentText", krk_bim_getDocumentText);
 	krk_defineNative(&bimModule->fields, "renderError", krk_bim_renderError);
 
+	/**
+	 * Class representing a BIM_ACTION.
+	 * Actions end up in __builtins__, which is dirty, but done for config reasons.
+	 * Calling an action executes it.
+	 */
 	makeClass(bimModule, &ActionDef, "Action", vm.baseClasses->objectClass);
 	ActionDef->allocSize = sizeof(struct ActionDef);
 	krk_defineNative(&ActionDef->methods, "__call__", bim_krk_action_call);
@@ -11022,11 +11109,15 @@ void initialize(void) {
 		krk_attachNamedObject(&vm.builtins->fields, a->name, (KrkObj*)actionObj);
 	}
 
+	/* Class representing a BIM_COMMAND. Works the same as actions. */
 	makeClass(bimModule, &CommandDef, "Command", vm.baseClasses->objectClass);
 	CommandDef->allocSize = sizeof(struct CommandDef);
 	krk_defineNative(&CommandDef->methods, "__call__", bim_krk_command_call);
 	krk_finalizeClass(CommandDef);
 
+	/* For silly legacy config reasons, we have a special 'global' namespace
+	 * that we just shove into __builtins__. This contains all of the command
+	 * objects that are bound with names starting with "global.", naturally. */
 	KrkInstance * global = krk_newInstance(vm.baseClasses->objectClass);
 	krk_attachNamedObject(&vm.builtins->fields, "global", (KrkObj*)global);
 
@@ -11040,16 +11131,44 @@ void initialize(void) {
 		}
 	}
 
+	/**
+	 * SyntaxState is the base class for syntax highlighters.
+	 *
+	 * @class SyntaxState
+	 *  @e Properties
+	 *   @b state  Read-write access to the underlying state number (used for passing context between lines)
+	 *   @b i      Read access to the offset into the line.
+	 *   @b lineno Read access to the line number of the line being highlighted.
+	 *
+	 *  @e Methods
+	 *   @b findKeywords()     Takes a list of keywords and highlights with a given flag based on a qualifier.
+	 *   @b isdigit()          Determines if the argument character is a "digit" (0-9)
+	 *   @b isxdigit()         Determines if the argument character is a "hex digit" (0-9, a-f, A-F)
+	 *   @b paint()            Paints a number of character cells a given color and advances the highlighter.
+	 *   @b paintComment()     Paints an end-of-line comment, with buzzword handling. Legacy convenience function.
+	 *   @b skip()             Moves the highlighter forward one character cell without painting.
+	 *   @b matchAndPaint()    Similar to @c findKeywords but only highlights one thing.
+	 *   @b commentBuzzwords() Detects and automatically highlights common comment buzzwords. Legacy convenience function.
+	 *   @b rewind()           Rewinds the highlighter, moving it back to a previous character cell.
+	 *   @b __getitem__()      Index into character cells of the current line from the highlighter.
+	 *                         Note, negative indexes will reference cells before the 'cursor', but this
+	 *                         does not apply to slicing, which treats the rest of the line (starting at the
+	 *                         cursor) as a single string, thus -1 is the last character of the line.
+	 *                         Indexing returns @c None rather than raising an IndexError if the requested
+	 *                         character is out of range, similar to behavior of the C @c charrel interface.
+	 *  @e Flags
+	 *   These flags supply the C FLAG_ constants. Unfortunately, this is kinda slow, and
+	 *   it would be nice to have some sort of compile-time constant available so that these
+	 *   don't have to imply attribute lookups at runtime...
+	 */
 	makeClass(bimModule, &syntaxStateClass, "SyntaxState", vm.baseClasses->objectClass);
 	syntaxStateClass->allocSize = sizeof(struct SyntaxState);
-	krk_defineNative(&syntaxStateClass->methods, "set_state", bim_krk_state_setstate); /* TODO property? */
-	krk_defineNative(&syntaxStateClass->methods, "state", bim_krk_state_getstate)->flags |= KRK_NATIVE_FLAGS_IS_DYNAMIC_PROPERTY;
-	krk_defineNative(&syntaxStateClass->methods, "i", bim_krk_state_index)->flags |= KRK_NATIVE_FLAGS_IS_DYNAMIC_PROPERTY;
-	krk_defineNative(&syntaxStateClass->methods, "lineno", bim_krk_state_lineno)->flags |= KRK_NATIVE_FLAGS_IS_DYNAMIC_PROPERTY;
+	krk_defineNative(&syntaxStateClass->methods, "state", bim_krk_state_getstate)->obj.flags |= KRK_OBJ_FLAGS_FUNCTION_IS_DYNAMIC_PROPERTY;
+	krk_defineNative(&syntaxStateClass->methods, "i", bim_krk_state_index)->obj.flags |= KRK_OBJ_FLAGS_FUNCTION_IS_DYNAMIC_PROPERTY;
+	krk_defineNative(&syntaxStateClass->methods, "lineno", bim_krk_state_lineno)->obj.flags |= KRK_OBJ_FLAGS_FUNCTION_IS_DYNAMIC_PROPERTY;
 	krk_defineNative(&syntaxStateClass->methods, "__init__", bim_krk_state_init);
-	/* These ones take argumens so they're methods instead of dynamic fields */
 	krk_defineNative(&syntaxStateClass->methods, "findKeywords", bim_krk_state_findKeywords);
-	krk_defineNative(&syntaxStateClass->methods, "cKeywordQualifier", bim_krk_state_cKeywordQualifier)->flags |= KRK_NATIVE_FLAGS_IS_STATIC_METHOD;
+	krk_defineNative(&syntaxStateClass->methods, "cKeywordQualifier", bim_krk_state_cKeywordQualifier)->obj.flags |= KRK_OBJ_FLAGS_FUNCTION_IS_STATIC_METHOD;
 	krk_defineNative(&syntaxStateClass->methods, "isdigit", bim_krk_state_isdigit);
 	krk_defineNative(&syntaxStateClass->methods, "isxdigit", bim_krk_state_isxdigit);
 	krk_defineNative(&syntaxStateClass->methods, "paint", bim_krk_state_paint);
@@ -11059,7 +11178,10 @@ void initialize(void) {
 	krk_defineNative(&syntaxStateClass->methods, "commentBuzzwords", bim_krk_state_commentBuzzwords);
 	krk_defineNative(&syntaxStateClass->methods, "rewind", bim_krk_state_rewind);
 	krk_defineNative(&syntaxStateClass->methods, "__getitem__", bim_krk_state_get);
-	krk_defineNative(&syntaxStateClass->methods, "__getslice__", bim_krk_state_getslice);
+	krk_defineNative(&syntaxStateClass->methods, "__setitem__", bim_krk_state_paint);
+	krk_defineNative(&syntaxStateClass->methods, "__contains__", bim_krk_state_check);
+	krk_defineNative(&syntaxStateClass->methods, "__mod__", bim_krk_state_getstate);
+	krk_defineNative(&syntaxStateClass->methods, "__lshift__", bim_krk_state_setstate);
 	krk_attachNamedValue(&syntaxStateClass->methods, "FLAG_NONE", INTEGER_VAL(FLAG_NONE));
 	krk_attachNamedValue(&syntaxStateClass->methods, "FLAG_KEYWORD", INTEGER_VAL(FLAG_KEYWORD));
 	krk_attachNamedValue(&syntaxStateClass->methods, "FLAG_STRING", INTEGER_VAL(FLAG_STRING));
@@ -11078,6 +11200,9 @@ void initialize(void) {
 	krk_attachNamedValue(&syntaxStateClass->methods, "FLAG_SPECIAL", INTEGER_VAL(FLAG_SPECIAL));
 	krk_attachNamedValue(&syntaxStateClass->methods, "FLAG_UNDERLINE", INTEGER_VAL(FLAG_UNDERLINE));
 
+	
+
+	/* This is a dumb cache of characters to avoid recreating them all the time */
 	_bim_state_chars = krk_newTuple(95);
 	krk_attachNamedObject(&syntaxStateClass->methods, "__chars__", (KrkObj*)_bim_state_chars);
 	for (int c = 0; c < 95; ++c) {
@@ -11127,6 +11252,7 @@ void init_terminal(void) {
 	signal(SIGWINCH, SIGWINCH_handler);
 	signal(SIGCONT,  SIGCONT_handler);
 	signal(SIGTSTP,  SIGTSTP_handler);
+	signal(SIGINT,   SIGINT_handler);
 }
 
 struct action_def * find_action(void (*action)()) {
@@ -11183,7 +11309,7 @@ void dump_commands(void) {
 	printf("|-------------|-----------------|\n");
 	offsets = malloc(sizeof(int) * flex_prefix_commands_count);
 	for (int i = 0; i < flex_prefix_commands_count; ++i) offsets[i] = i;
-	qsort(offsets, flex_prefix_commands_count, sizeof(int), sort_regular_commands);
+	qsort(offsets, flex_prefix_commands_count, sizeof(int), sort_prefix_commands);
 	for (int i = 0; i < flex_prefix_commands_count; ++i) {
 		printf("| `:%s...` | %s |\n", !strcmp(prefix_commands[offsets[i]].name, "`") ? "`(backtick)`" : 
 			prefix_commands[offsets[i]].name, prefix_commands[offsets[i]].description);
@@ -11543,10 +11669,21 @@ _argument_error:
 int main(int argc, char * argv[]) {
 	findBim(argv);
 	int opt;
-	while ((opt = getopt(argc, argv, "?c:C:u:RS:O:-:")) != -1) {
+	while ((opt = getopt(argc, argv, "?c:C:u:q:RS:O:-:")) != -1) {
 		switch (opt) {
 			case 'R':
 				global_config.initial_file_is_read_only = 1;
+				break;
+			case 'q':;
+				initialize();
+				global_config.use_biminfo = 0;
+				global_config.go_to_line = 0;
+				open_file(optarg);
+				env->loading = 1;
+				for (int i = 0; i < env->line_count; ++i) {
+					recalculate_syntax(env->lines[i], i);
+				}
+				return 0;
 				break;
 			case 'c':
 			case 'C':
